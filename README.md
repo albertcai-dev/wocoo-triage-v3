@@ -24,6 +24,23 @@ Scripts are plain `var`-scoped globals compiled in the browser by Babel standalo
 
 ## Syncing with the Magic site
 
+`./sync.sh` pulls all five files from the live site and commits the diff:
+
+```
+./sync.sh              # pull, syntax-check, commit if changed
+./sync.sh --no-commit  # pull and check only, leave changes in the working tree
+./sync.sh --dry-run    # pull into a temp dir and print the diff, touch nothing
+```
+
+It shells out to `claude -p --output-format stream-json` and lifts the raw
+`magic_file_read` tool_result payloads out of the stream, so file bytes land on
+disk exactly as the tool returned them — the model never retypes content. If a
+result overflows and the harness spills it to a dump file, the parser follows the
+`Output has been saved to …` pointer. A pull that misses any of the five files
+aborts before writing.
+
+### Manual equivalents
+
 Pull (read one file):
 
 ```
