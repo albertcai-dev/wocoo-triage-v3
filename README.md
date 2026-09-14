@@ -32,12 +32,13 @@ Scripts are plain `var`-scoped globals compiled in the browser by Babel standalo
 ./sync.sh --dry-run    # pull into a temp dir and print the diff, touch nothing
 ```
 
-It shells out to `claude -p --output-format stream-json` and lifts the raw
-`magic_file_read` tool_result payloads out of the stream, so file bytes land on
+It shells out to `claude -p --output-format stream-json`; `sync-parse.py` lifts the
+raw `magic_file_read` tool_result payloads out of the stream, so file bytes land on
 disk exactly as the tool returned them — the model never retypes content. If a
 result overflows and the harness spills it to a dump file, the parser follows the
-`Output has been saved to …` pointer. A pull that misses any of the five files
-aborts before writing.
+`Output has been saved to …` pointer. Files that don't come back are retried (up
+to 3 attempts); a still-incomplete pull exits non-zero, prints a preview of every
+tool result it did see, and keeps the transcript at `.sync-stream.jsonl`.
 
 ### Manual equivalents
 
