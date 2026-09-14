@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>WOCOO Triage Dashboard v2</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; margin: 0; transition: background-color 0.2s, color 0.2s; }
+
+  /* ===== Dark mode overrides (toggled via body.dark-mode) ===== */
+  body.dark-mode { background: #0f172a !important; color: #e2e8f0 !important; }
+  body.dark-mode h1, body.dark-mode h2, body.dark-mode h3, body.dark-mode h4 { color: #f1f5f9 !important; }
+  body.dark-mode table { background: transparent !important; }
+  body.dark-mode table th { background: #1e293b !important; color: #cbd5e1 !important; border-bottom-color: #334155 !important; }
+  body.dark-mode table td { background: #0f172a !important; color: #e2e8f0 !important; border-bottom-color: #334155 !important; }
+  body.dark-mode table tr.expanded > td { background: #1e1b4b !important; }
+  body.dark-mode input, body.dark-mode textarea, body.dark-mode select { background: #1e293b !important; color: #e2e8f0 !important; border-color: #475569 !important; }
+  body.dark-mode input::placeholder, body.dark-mode textarea::placeholder { color: #64748b !important; }
+  /* Generic background overrides for the white card surfaces used throughout.
+     React serializes inline `background:"#fff"` to `style="background: rgb(255, 255, 255);"` in the DOM,
+     so attribute selectors must match the rgb() form (the hex form is also matched as a fallback). */
+  body.dark-mode div[style*="rgb(255, 255, 255)"],
+  body.dark-mode div[style*="rgb(255,255,255)"],
+  body.dark-mode div[style*="background:#fff"],
+  body.dark-mode div[style*="background: #fff"] { background-color: #1e293b !important; color: #e2e8f0 !important; border-color: #334155 !important; }
+
+  body.dark-mode div[style*="rgb(249, 250, 251)"],
+  body.dark-mode div[style*="rgb(249,250,251)"],
+  body.dark-mode div[style*="background:#f9fafb"] { background-color: #0f172a !important; color: #cbd5e1 !important; border-color: #334155 !important; }
+
+  body.dark-mode div[style*="rgb(243, 244, 246)"],
+  body.dark-mode div[style*="rgb(243,244,246)"],
+  body.dark-mode div[style*="background:#f3f4f6"] { background-color: #334155 !important; color: #cbd5e1 !important; }
+
+  body.dark-mode div[style*="rgb(238, 242, 255)"],
+  body.dark-mode div[style*="rgb(238,242,255)"],
+  body.dark-mode div[style*="background:#eef2ff"] { background-color: #1e1b4b !important; color: #c7d2fe !important; border-color: #3730a3 !important; }
+
+  /* Spans with light backgrounds (status badges, etc.) — invert background lightness */
+  body.dark-mode span[style*="rgb(255, 255, 255)"] { background-color: #1e293b !important; }
+
+  /* Border-color overrides for the common light-gray border #e5e7eb → dark slate */
+  body.dark-mode [style*="rgb(229, 231, 235)"],
+  body.dark-mode [style*="rgb(243, 244, 246)"] { border-color: #334155 !important; }
+
+  /* ===== SLA aging row tints (toggled via body.sla-colors) ===== */
+  body.sla-colors tr.sla-warn td { background: #fef3c7 !important; }
+  body.sla-colors tr.sla-warn:hover td { background: #fde68a !important; }
+  body.sla-colors tr.sla-urgent td { background: #fee2e2 !important; }
+  body.sla-colors tr.sla-urgent:hover td { background: #fecaca !important; }
+  body.dark-mode.sla-colors tr.sla-warn td { background: rgba(245,158,11,0.18) !important; }
+  body.dark-mode.sla-colors tr.sla-warn:hover td { background: rgba(245,158,11,0.28) !important; }
+  body.dark-mode.sla-colors tr.sla-urgent td { background: rgba(239,68,68,0.20) !important; }
+  body.dark-mode.sla-colors tr.sla-urgent:hover td { background: rgba(239,68,68,0.30) !important; }
+  /* Don't tint the expanded-row content cell or the inner expansion content row */
+  body.sla-colors tr.expanded > td,
+  body.dark-mode.sla-colors tr.expanded > td { background: #eef2ff !important; }
+  body.dark-mode.sla-colors tr.expanded > td { background: #1e1b4b !important; }
+
+  /* Settings tab toggle switches */
+  .ws-toggle { width: 46px; height: 24px; border-radius: 12px; border: none; cursor: pointer; position: relative; background: #d1d5db; transition: background 0.2s; padding: 0; flex-shrink: 0; }
+  .ws-toggle.on { background: #4f46e5; }
+  .ws-toggle .knob { width: 18px; height: 18px; border-radius: 9px; background: #fff; position: absolute; top: 3px; left: 3px; transition: left 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+  .ws-toggle.on .knob { left: 25px; }
+
+  /* Pressed (mouse-down) feedback on every button — applies to inline-styled buttons too */
+  button:active:not(:disabled) { filter: brightness(0.82); transition: filter 0.05s ease-out; }
+
+  /* Modal entrance animations */
+  @keyframes wocoo-fadein { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes wocoo-slidein { from { opacity: 0; transform: translateY(8px) scale(0.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
+  .wocoo-modal-overlay { animation: wocoo-fadein 0.18s ease-out; }
+  .wocoo-modal-content { animation: wocoo-slidein 0.22s cubic-bezier(0.16, 1, 0.3, 1); }
+
+  /* Skeleton shimmer (used during reload) */
+  @keyframes wocoo-shimmer {
+    0% { background-position: -240px 0; }
+    100% { background-position: calc(240px + 100%) 0; }
+  }
+  .wocoo-skel {
+    display: inline-block;
+    background-color: #e5e7eb;
+    background-image: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.55) 50%, transparent 100%);
+    background-size: 240px 100%;
+    background-repeat: no-repeat;
+    animation: wocoo-shimmer 1.4s ease-in-out infinite;
+    border-radius: 4px;
+    vertical-align: middle;
+  }
+  body.dark-mode .wocoo-skel {
+    background-color: #334155;
+    background-image: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.08) 50%, transparent 100%);
+  }
+
+  /* Row hover (excludes SLA-tinted rows and expanded rows which already have their own bg) */
+  tbody tr.clickable:not(.sla-warn):not(.sla-urgent):not(.expanded):hover td {
+    background: #e5e7eb !important;
+    transition: background 0.1s ease-out;
+  }
+  body.dark-mode tbody tr.clickable:not(.sla-warn):not(.sla-urgent):not(.expanded):hover td {
+    background: #0f172a !important;
+  }
+
+  /* Toast notifications */
+  .wocoo-toast-container {
+    position: fixed; top: 20px; right: 20px; z-index: 5000;
+    display: flex; flex-direction: column; gap: 8px;
+    pointer-events: none;
+  }
+  .wocoo-toast {
+    padding: 10px 16px; border-radius: 8px;
+    font-size: 13px; font-weight: 500;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    background: #fff; color: #1f2937;
+    border: 1px solid #e5e7eb;
+    animation: wocoo-toast-in 0.25s ease-out;
+    pointer-events: auto;
+    min-width: 280px; max-width: 380px;
+  }
+  .wocoo-toast.success { background: #f0fdf4; color: #166534; border-color: #bbf7d0; }
+  .wocoo-toast.error   { background: #fef2f2; color: #991b1b; border-color: #fecaca; }
+  .wocoo-toast.info    { background: #eef2ff; color: #3730a3; border-color: #c7d2fe; }
+  body.dark-mode .wocoo-toast { background: #1e293b; color: #e2e8f0; border-color: #334155; }
+  body.dark-mode .wocoo-toast.success { background: #052e16; color: #86efac; border-color: #14532d; }
+  body.dark-mode .wocoo-toast.error { background: #450a0a; color: #fca5a5; border-color: #7f1d1d; }
+  body.dark-mode .wocoo-toast.info { background: #1e1b4b; color: #c7d2fe; border-color: #3730a3; }
+  @keyframes wocoo-toast-in {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+
+  /* Day/Night animated toggle */
+  .dn-toggle {
+    position: relative;
+    width: 76px;
+    height: 32px;
+    border-radius: 16px;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    overflow: hidden;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, #4ba3d4 0%, #7ec2e3 55%, #aed6e6 100%);
+    transition: background 0.5s ease, box-shadow 0.5s ease;
+    box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.12);
+  }
+  .dn-toggle.on {
+    background: linear-gradient(135deg, #0a1530 0%, #15264a 65%, #1f3461 100%);
+    box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.35);
+  }
+  .dn-toggle:focus { outline: 2px solid #4f46e5; outline-offset: 2px; }
+  .dn-clouds, .dn-stars {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+    transition: opacity 0.5s ease;
+  }
+  .dn-clouds {
+    opacity: 1;
+    background-image:
+      radial-gradient(ellipse 9px 4px at 58% 42%, rgba(255,255,255,0.95) 0%, rgba(255,255,255,0.4) 70%, transparent 100%),
+      radial-gradient(ellipse 11px 5px at 72% 62%, rgba(255,255,255,0.9) 0%, rgba(255,255,255,0.3) 75%, transparent 100%),
+      radial-gradient(ellipse 7px 3px at 83% 35%, rgba(255,255,255,0.85) 0%, transparent 80%);
+  }
+  .dn-toggle.on .dn-clouds { opacity: 0; }
+  .dn-stars {
+    opacity: 0;
+    background-image:
+      radial-gradient(circle 1.2px at 18% 28%, #fff 100%, transparent 100%),
+      radial-gradient(circle 0.8px at 26% 65%, #fff 100%, transparent 100%),
+      radial-gradient(circle 1px at 36% 22%, #fff 100%, transparent 100%),
+      radial-gradient(circle 0.6px at 22% 48%, rgba(255,255,255,0.7) 100%, transparent 100%),
+      radial-gradient(circle 1px at 12% 72%, #fff 100%, transparent 100%),
+      radial-gradient(circle 0.7px at 40% 55%, rgba(255,255,255,0.8) 100%, transparent 100%),
+      radial-gradient(circle 0.8px at 32% 38%, #fff 100%, transparent 100%);
+  }
+  .dn-toggle.on .dn-stars { opacity: 1; }
+  .dn-knob {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 32% 32%, #ffd75e 0%, #ffb300 65%, #ff8c00 100%);
+    box-shadow: 0 0 9px rgba(255, 195, 80, 0.65), 0 1px 3px rgba(0, 0, 0, 0.25);
+    transition: left 0.45s cubic-bezier(0.4, 0, 0.2, 1), background 0.5s ease, box-shadow 0.5s ease;
+    z-index: 3;
+  }
+  .dn-toggle.on .dn-knob {
+    left: 48px;
+    background:
+      radial-gradient(circle 1.6px at 64% 35%, rgba(0,0,0,0.18) 100%, transparent 100%),
+      radial-gradient(circle 1.2px at 46% 62%, rgba(0,0,0,0.15) 100%, transparent 100%),
+      radial-gradient(circle 0.9px at 70% 65%, rgba(0,0,0,0.12) 100%, transparent 100%),
+      radial-gradient(circle at 32% 32%, #ffffff 0%, #e2e2e2 55%, #a8a8a8 100%);
+    box-shadow: 0 0 9px rgba(255, 255, 255, 0.4), 0 1px 3px rgba(0, 0, 0, 0.4), inset -3px -3px 5px rgba(0, 0, 0, 0.2), inset 2px 2px 2px rgba(255, 255, 255, 0.45);
+  }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+window.addEventListener('error', function(e) {
+  var app = document.getElementById('app');
+  if (!app || app.dataset.errored) return;
+  app.dataset.errored = '1';
+  var msg = e && e.message ? e.message : 'Unknown error';
+  var src = (e && e.filename ? e.filename : '') + ':' + (e && e.lineno ? e.lineno : '?') + ':' + (e && e.colno ? e.colno : '?');
+  var stack = (e && e.error && e.error.stack) ? e.error.stack : '';
+  app.innerHTML = '<div style="padding:20px;background:#fee2e2;border:2px solid #dc2626;border-radius:8px;font-family:monospace;color:#7f1d1d"><h2 style="margin:0 0 8px">Script error</h2><div><strong>' + msg + '</strong></div><div style="margin-top:4px;font-size:12px">' + src + '</div><pre style="margin-top:8px;font-size:11px;white-space:pre-wrap">' + stack + '</pre></div>';
+});
+window._mainParsed = false;
+setTimeout(function() {
+  if (window._mainParsed) return;
+  var app = document.getElementById('app');
+  if (!app || app.dataset.errored) return;
+  app.innerHTML = '<div style="padding:20px;background:#fef3c7;border:2px solid #d97706;border-radius:8px;font-family:monospace;color:#78350f"><h2 style="margin:0 0 8px">Main script did not parse</h2><div>Check the browser console for the parse error.</div></div>';
+}, 4000);
+</script>
+
+<script type="text/babel" data-presets="env,react" src="app-data.js"></script>
+<script type="text/babel" data-presets="env,react" src="app-core.js"></script>
+<script type="text/babel" data-presets="env,react" src="app-workflows.js"></script>
+<script type="text/babel" data-presets="env,react" src="app-dashboard.js"></script>
+</body>
+</html>
