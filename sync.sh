@@ -70,25 +70,31 @@ def absorb(text):
     if m and os.path.exists(m.group(1)):
         absorb(open(m.group(1)).read())
 
+def walk(node):
+    """Event shapes vary (message can be a bare string), so hunt for tool_result blocks anywhere."""
+    if isinstance(node, dict):
+        if node.get("type") == "tool_result":
+            content = node.get("content")
+            if isinstance(content, str):
+                absorb(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        absorb(part.get("text", ""))
+        for value in node.values():
+            walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value)
+
 for line in open(stream):
     line = line.strip()
     if not line:
         continue
     try:
-        event = json.loads(line)
+        walk(json.loads(line))
     except json.JSONDecodeError:
         continue
-    message = event.get("message") or {}
-    for block in message.get("content", []) or []:
-        if not isinstance(block, dict) or block.get("type") != "tool_result":
-            continue
-        content = block.get("content")
-        if isinstance(content, str):
-            absorb(content)
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    absorb(part.get("text", ""))
 
 missing = [f for f in wanted if f not in found]
 if missing:
