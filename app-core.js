@@ -220,7 +220,9 @@ function logTicketMoveErrorMcp(args) {
   }, "errorLogged");
 }
 
-function callBridgeViaIframe(actionName, params, messageAction) {
+// `timeoutMs` is optional and defaults to 30s. The Custom CC Statement actions need
+// longer — a Doc copy plus a PDF export routinely brushes past 30s.
+function callBridgeViaIframe(actionName, params, messageAction, timeoutMs) {
   return new Promise(function(resolve, reject) {
     if (!BRIDGE_URL) { reject(new Error("Bridge URL not configured.")); return; }
     var allParams = Object.assign({ action: actionName }, params);
@@ -252,10 +254,11 @@ function callBridgeViaIframe(actionName, params, messageAction) {
     };
     window.addEventListener("message", onMsg);
     document.body.appendChild(iframe);
+    var limitMs = timeoutMs || 30000;
     timeoutId = setTimeout(function() {
       cleanup();
-      reject(new Error("Bridge call timed out after 30s."));
-    }, 30000);
+      reject(new Error("Bridge call timed out after " + Math.round(limitMs / 1000) + "s."));
+    }, limitMs);
   });
 }
 
@@ -361,6 +364,460 @@ function sendKohoEmailViaBridge(ticketId, subject, body) {
       reject(new Error("Koho email send timed out (no response from bridge in 30s)."));
     }, 30000);
   });
+}
+
+// ============ MOBILE CHEQUE VALIDATION ============
+// Daily 9 AM validation of mobile cheque deposit returns. Apps Script does all the Gmail
+// + Sheet + totals work; this side only renders the record and ships the Slack digest.
+//
+// Ported from the extension's sidepanel/MobileChequeValidation.tsx and
+// data/chequeValidationConfig.ts. Keep the message templates in sync — the channel post
+// is read by ~15 people and a wording drift between the two clients would show.
+//
+// The Slack POST goes through the bridge (`sendMcvWebhook`, McvWebhook.gs) rather than
+// straight from this page: hooks.slack.com sends no CORS headers, and unlike the
+// extension a Magic site has no host permission to bypass that.
+
+var MCV_CHANNEL_NAME = "mobile-cheque-deposits-returns-working-group";
+
+/** Names typed verbatim into Slack's @mention autocomplete, in the canonical cc order. */
+var MCV_CC_NAMES = ["Estelle","Muaiz Khan","Jonathan Fawcett","Vanessa","Nick Kiss",
+  "Eugene","Paula Bastos","Odi","Taylor","Rose","adriana","Luke Gazmin","Albert","Ishan",
+  "Amanda Burke"];
+
+/** "2026-06-15" -> "June 15th, 2026" */
+function formatMcvDate(yyyyMmDd){
+  var parts=String(yyyyMmDd||"").split("-").map(Number);
+  var y=parts[0],m=parts[1],d=parts[2];
+  if(!y||!m||!d)return yyyyMmDd;
+  var months=["January","February","March","April","May","June","July","August","September","October","November","December"];
+  var suffix=function(n){
+    if(n%100>=11&&n%100<=13)return "th";
+    if(n%10===1)return "st";
+    if(n%10===2)return "nd";
+    if(n%10===3)return "rd";
+    return "th";
+  };
+  return months[m-1]+" "+d+suffix(d)+", "+y;
+}
+
+function buildMcvMessage(dateKey,t){
+  return [
+    "Hey Team, Here's a Validation update on mobile cheque deposit returns for "+formatMcvDate(dateKey)+".",
+    "",
+    "Cheque Returns: ✍️",
+    "Of the cheque "+t.receivedCount+" return images received, we have successfully processed "+t.processedCount+" ✅",
+    "Additionally "+t.day1Reversed+" \"Day 1 Cheques\" received via email have been reversed",
+    "",
+    "Breaches: 🤚",
+    t.opsSlaBreach+" Cheques breached Ops Reversal SLA",
+    t.riskSlaBreach+" Cheques breached Risk SLA",
+    "",
+    "cc: "+MCV_CC_NAMES.map(function(n){return "@"+n}).join(" ")
+  ].join("\n");
+}
+
+function buildMcvAnomalyDM(dateKey,anomalies){
+  return ["⚠ Mobile Cheque Validation needs attention for "+formatMcvDate(dateKey)+".","",
+    "Channel post was NOT sent. Issues found:"]
+    .concat((anomalies||[]).map(function(a){return "• "+a.kind+": "+a.detail}))
+    .concat(["","Open the tracker sheet to investigate."]).join("\n");
+}
+
+/** Local YYYY-MM-DD. The Slack header carries today's date, not the batch's. */
+function mcvTodayKey(){
+  var d=new Date();
+  var mm=String(d.getMonth()+1);if(mm.length<2)mm="0"+mm;
+  var dd=String(d.getDate());if(dd.length<2)dd="0"+dd;
+  return d.getFullYear()+"-"+mm+"-"+dd;
+}
+
+// ---- Bridge calls. The first three are already live in the Apps Script project;
+// ---- sendMcvWebhook comes from McvWebhook.gs and needs pasting + 1 router line.
+
+/** Runs the whole pipeline now. 120s — a 50k-row CSV paste plus recalc outlasts 30s. */
+function runMcvViaBridge(){
+  return callBridgeViaIframe("runMobileChequeValidation",{},"mobileChequeValidationRun",120000)
+    .then(function(d){
+      var rec=d.record||(d.result&&d.result.record);
+      if(!rec)throw new Error("Bridge returned no validation record.");
+      return rec;
+    });
+}
+
+/** Cached record for today, or null if no run has happened yet. */
+function getMcvStatusViaBridge(){
+  return callBridgeViaIframe("getMobileChequeValidationStatus",{},"mobileChequeValidationStatus",30000)
+    .then(function(d){
+      // canRun is tri-state on purpose: true/false once the bridge reports it, null when
+      // the deployed bridge predates the owner guard. Callers must gate on `!== false`
+      // so an older deployment keeps the previous behaviour instead of hiding the button.
+      return {dateKey:String(d.dateKey||""),record:(d.record!==undefined?d.record:(d.result&&d.result.record))||null,canRun:(typeof d.canRun==="boolean"?d.canRun:null)};
+    });
+}
+
+function markMcvSentViaBridge(dateKey){
+  return callBridgeViaIframe("markMobileChequeValidationSent",{dateKey:dateKey},"mobileChequeValidationMarkSent",30000);
+}
+
+/**
+ * Relays the Slack Workflow Builder post. `kind` picks the workflow and therefore the
+ * payload shape: "ready" ships 6 structured variables, "anomaly" ships one body string.
+ */
+function sendMcvWebhookViaBridge(kind,vars){
+  var params=Object.assign({kind:kind},vars||{});
+  return callBridgeViaIframe("sendMcvWebhook",params,"mcvWebhookSent",60000)
+    .then(function(d){
+      if(d.ok===false)throw new Error(d.error||"Bridge could not post the Slack webhook");
+      return d.result||{};
+    });
+}
+
+// ============ CUSTOM CC STATEMENT — PDF parse + doc build via bridge ============
+// Issues a corrected credit card statement when the statement Wealthsimple generated
+// carried stale client data AND the error was ours. Driver ticket: WOCOO-28171.
+//
+// This is a port of the WOCOO Triager extension's data/ccStatementParse.ts. Keep the two
+// in sync: the parsing logic is identical on purpose, so a fix found on one side belongs
+// on the other. The Apps Script side (CustomCcStatement.gs) is shared by both.
+
+// pdf.js 3.x, not 4.x — v4 ships ESM only, and this site loads plain <script> tags.
+var CC_PDFJS_VERSION = "3.11.174";
+var CC_PDFJS_BASE = "https://unpkg.com/pdfjs-dist@" + CC_PDFJS_VERSION;
+
+// U+23CE marks the newline inside a DETAILS cell (the FX sub-line) across the query string.
+var CC_NEWLINE_MARKER = "⏎";
+
+var _ccPdfjsPromise = null;
+
+// Loaded on first use rather than in index.html — pdf.js is ~350 KB and most sessions
+// never open this tool.
+function ccLoadPdfjs() {
+  if (_ccPdfjsPromise) return _ccPdfjsPromise;
+  _ccPdfjsPromise = new Promise(function(resolve, reject) {
+    if (window.pdfjsLib) { resolve(window.pdfjsLib); return; }
+    var s = document.createElement("script");
+    s.src = CC_PDFJS_BASE + "/build/pdf.min.js";
+    s.onload = function() {
+      if (!window.pdfjsLib) { reject(new Error("pdf.js loaded but exposed no pdfjsLib.")); return; }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = CC_PDFJS_BASE + "/build/pdf.worker.min.js";
+      resolve(window.pdfjsLib);
+    };
+    s.onerror = function() { reject(new Error("Could not load pdf.js from unpkg — check your network.")); };
+    document.head.appendChild(s);
+  });
+  return _ccPdfjsPromise;
+}
+
+/** Text items whose baselines are within this many PDF units count as one visual line. */
+var CC_LINE_Y_TOLERANCE = 3;
+
+/**
+ * Rebuilds each page's visual lines. pdf.js returns text items in drawing order, so items
+ * are grouped by baseline y (transform[5]) then sorted left-to-right by x (transform[4]).
+ */
+function ccLinesFromItems(items) {
+  var rows = [];
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    if (!it || !it.str || !it.str.trim()) continue;
+    var tr = it.transform;
+    if (!tr || tr.length < 6) continue;
+    var x = tr[4], y = tr[5];
+    var row = null;
+    for (var r = 0; r < rows.length; r++) {
+      if (Math.abs(rows[r].y - y) <= CC_LINE_Y_TOLERANCE) { row = rows[r]; break; }
+    }
+    if (!row) { row = { y: y, items: [] }; rows.push(row); }
+    row.items.push({ x: x, str: it.str });
+  }
+  // PDF y grows upward, so descending y is top-to-bottom.
+  rows.sort(function(a, b) { return b.y - a.y; });
+  return rows.map(function(row) {
+    return row.items.sort(function(a, b) { return a.x - b.x; })
+      .map(function(i) { return i.str; })
+      .join(" ").replace(/\s+/g, " ").trim();
+  }).filter(Boolean);
+}
+
+/** File -> pages[pageIndex][lineIndex]. Parsed in the browser; nothing is uploaded. */
+function ccExtractStatementText(file) {
+  return ccLoadPdfjs().then(function(pdfjs) {
+    return file.arrayBuffer().then(function(buf) {
+      return pdfjs.getDocument({ data: new Uint8Array(buf) }).promise;
+    }).then(function(doc) {
+      var pages = [];
+      var chain = Promise.resolve();
+      for (var n = 1; n <= doc.numPages; n++) {
+        (function(pageNum) {
+          chain = chain.then(function() {
+            return doc.getPage(pageNum).then(function(page) {
+              return page.getTextContent();
+            }).then(function(content) {
+              pages.push(ccLinesFromItems(content.items));
+            });
+          });
+        })(n);
+      }
+      return chain.then(function() {
+        try { doc.destroy(); } catch (e) {}
+        var empty = pages.every(function(p) { return p.length === 0; });
+        if (empty) {
+          throw new Error("No text found in that PDF — it looks like a scan or an image-only export. Statement PDFs downloaded from Atlas have real text; try re-downloading it.");
+        }
+        return pages;
+      });
+    });
+  });
+}
+
+// Longest first, so "Refund settled" wins over "Refund" and "Cash advance" over "Cash".
+// Anchoring TYPE to a known set is what keeps DETAILS unambiguous — merchant names can
+// otherwise look like anything.
+var CC_ROW_TYPES = ["Refund settled", "Balance transfer", "Cash advance", "Cash-like",
+  "Adjustment", "Reversal", "Purchase", "Payment", "Interest", "Refund", "Credit", "Fee"];
+
+// "Jul 25", and the kerning-split "Aug 1 1". Greedy, so the longer day wins.
+var CC_DATE_PAT = "[A-Z][a-z]{2}\\s+\\d(?:\\s?\\d)?";
+// "$52.89", "–$2,714.06", and the kerning-split "$320.1 1". Spaces inside the digit runs
+// are artifacts and get stripped; they are never real.
+var CC_AMOUNT_PAT = "[–\\-−]?\\$[\\d,][\\d,\\s]*\\.[\\d\\s]*\\d";
+
+var CC_ROW_RE = new RegExp("^(" + CC_DATE_PAT + ")\\s+(" + CC_DATE_PAT + ")\\s+(" +
+  CC_ROW_TYPES.join("|") + ")\\s+(.+?)\\s+(" + CC_AMOUNT_PAT + ")\\s*$");
+
+// "345.84 EUR • 1.620981 exchange rate" — belongs to the row above, not a row itself.
+var CC_FX_SUBLINE_RE = /^[\d,.\s]+[A-Z]{3}\s*[•·]\s*[\d.\s]+exchange rate$/;
+
+var CC_MONTHS_FULL = "January|February|March|April|May|June|July|August|September|October|November|December";
+var CC_MONTH_ABBREVS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+var CC_CARD_RE = /^\d{4}\s+\d{2}\*{2}\s+\*{4}\s+\d{4}$/;
+
+/**
+ * Deterministic on purpose, not model-driven: every number here lands on a document a
+ * client reads, so failing loudly (blank field, zero rows, an arithmetic warning) beats a
+ * model that fails plausibly. Never throws — fills what it can and appends to `warnings`.
+ */
+function ccParseStatement(pages) {
+  var warnings = [];
+  var page1 = pages[0] || [];
+  var page1Text = page1.join("\n");
+
+  var ident = ccParseIdentity(pages);
+  var period = ccParsePeriod(page1Text);
+  var headline = ccParseHeadline(page1);
+
+  var s = {
+    cardMasked: ident.cardMasked,
+    nameOnStatement: ident.name,
+    addressLines: ident.addressLines,
+    statementDate: ccFirstMatch(page1Text, new RegExp("Statement date\\s+((?:" + CC_MONTHS_FULL + ")\\s+\\d{1,2},?\\s*\\d{4})", "i")),
+    openingDate: period.opening,
+    closingDate: period.closing,
+    paymentDueDate: headline.dueDate,
+    creditLimit: ccAmountField(page1Text, "Credit limit"),
+    minimumPayment: ccAmountField(page1Text, "Minimum payment"),
+    // The headline pair ("$7,209.36   Sep 15, 2026") is the reliable source; the label
+    // itself arrives kerning-split as "STATEMENT BAL ANCE", so it is only a fallback.
+    statementBalance: headline.balance || ccAmountField(page1Text, "Statement bal\\s?ance"),
+    previousBalance: ccAmountField(page1Text, "Previous balance"),
+    payments: ccAmountField(page1Text, "[-–−]\\s*Payments"),
+    otherCredits: ccAmountField(page1Text, "[-–−]\\s*Other credits"),
+    purchases: ccAmountField(page1Text, "\\+\\s*Purchases"),
+    fees: ccAmountField(page1Text, "\\+\\s*Fees"),
+    // "+ Interest" only — never the rate rows, which carry a percentage.
+    interest: ccAmountField(page1Text, "\\+\\s*Interest"),
+    cashAdvances: ccAmountField(page1Text, "\\+\\s*Cash advances"),
+    totalCharges: ccAmountField(page1Text, "Total charges"),
+    totalPaymentsCredits: ccAmountField(page1Text, "Total payments/credits"),
+    newBalance: ccAmountField(page1Text, "New balance"),
+    annualInterestRate: ccPercentField(page1Text, "Annual interest rate"),
+    cashAdvanceInterestRate: ccPercentField(page1Text, "Cash advance interest rate"),
+    rows: ccParseRows(pages),
+    warnings: warnings
+  };
+
+  if (!s.rows.length) {
+    warnings.push("Found no activity rows. Either this is not a Wealthsimple statement, or its layout changed.");
+  }
+  var required = [["statement date", s.statementDate], ["payment due date", s.paymentDueDate],
+    ["credit limit", s.creditLimit], ["minimum payment", s.minimumPayment],
+    ["statement balance", s.statementBalance], ["new balance", s.newBalance]];
+  required.forEach(function(pair) {
+    if (!pair[1]) warnings.push("Could not find the " + pair[0] + " — fill it in below.");
+  });
+
+  var charged = 0;
+  s.rows.forEach(function(r) { if (!ccIsCredit(r.amount)) charged += ccNumericAmount(r.amount); });
+  var totalCharges = ccNumericAmount(s.totalCharges);
+  if (s.rows.length && totalCharges > 0 && Math.abs(charged - totalCharges) > 0.01) {
+    warnings.push("Activity charges add up to " + ccFormatAmount(charged) +
+      " but the summary says total charges are " + s.totalCharges +
+      ". Check for a missed row before generating.");
+  }
+  return s;
+}
+
+/** The identity block repeats on every page, so the first page carrying it is enough. */
+function ccParseIdentity(pages) {
+  for (var p = 0; p < pages.length; p++) {
+    var lines = pages[p];
+    var cardIdx = -1;
+    for (var i = 0; i < lines.length; i++) {
+      if (CC_CARD_RE.test(lines[i].trim())) { cardIdx = i; break; }
+    }
+    if (cardIdx === -1) continue;
+    var name = (lines[cardIdx + 1] || "").trim();
+    var addressLines = [];
+    for (var j = cardIdx + 2; j < lines.length && addressLines.length < 3; j++) {
+      var line = lines[j].trim();
+      if (!line || /^(Activity|Account summary|TRANS\.|STATEMENT|Information about|If you only)/i.test(line)) break;
+      addressLines.push(line);
+    }
+    return { cardMasked: lines[cardIdx].trim(), name: name, addressLines: addressLines };
+  }
+  return { cardMasked: "", name: "", addressLines: [] };
+}
+
+/**
+ * "Wealthsimple Jul 25 — Aug 24, 2026" carries only the closing year, so the opening year
+ * is inferred: a period running Dec -> Jan opened in the previous year.
+ */
+function ccParsePeriod(text) {
+  var m = text.match(new RegExp("\\b([A-Z][a-z]{2})\\s+(\\d{1,2})\\s*[—–-]\\s*([A-Z][a-z]{2})\\s+(\\d{1,2}),\\s*(\\d{4})"));
+  if (!m) return { opening: "", closing: "" };
+  var openIdx = CC_MONTH_ABBREVS.indexOf(m[1]);
+  var closeIdx = CC_MONTH_ABBREVS.indexOf(m[3]);
+  var openYear = (openIdx > closeIdx && openIdx !== -1 && closeIdx !== -1)
+    ? String(Number(m[5]) - 1) : m[5];
+  return { opening: m[1] + " " + m[2] + ", " + openYear, closing: m[3] + " " + m[4] + ", " + m[5] };
+}
+
+/** The big "$7,209.36   Sep 15, 2026" pair under the STATEMENT BALANCE / DUE DATE labels. */
+function ccParseHeadline(lines) {
+  var re = new RegExp("^(" + CC_AMOUNT_PAT + ")\\s+([A-Z][a-z]{2}\\s+\\d{1,2},\\s*\\d{4})$");
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].trim().match(re);
+    if (m) return { balance: ccTidyAmount(m[1]), dueDate: m[2].replace(/\s+/g, " ") };
+  }
+  return { balance: "", dueDate: "" };
+}
+
+function ccParseRows(pages) {
+  var rows = [];
+  pages.forEach(function(lines) {
+    lines.forEach(function(raw) {
+      var line = raw.trim();
+      if (CC_FX_SUBLINE_RE.test(line)) {
+        // Belongs to the row immediately above. With no such row it is dropped rather
+        // than guessed at.
+        var last = rows[rows.length - 1];
+        if (last && last.details.indexOf("\n") === -1) last.details += "\n" + line;
+        return;
+      }
+      var m = line.match(CC_ROW_RE);
+      if (!m) return;
+      rows.push({
+        transDate: ccTidyDate(m[1]),
+        postedDate: ccTidyDate(m[2]),
+        type: m[3],
+        details: m[4].trim(),
+        amount: ccTidyAmount(m[5])
+      });
+    });
+  });
+  return rows;
+}
+
+function ccFirstMatch(text, re) {
+  var m = text.match(re);
+  return m ? m[1].replace(/\s+/g, " ").trim() : "";
+}
+
+function ccAmountField(text, labelPattern) {
+  var m = text.match(new RegExp(labelPattern + "\\s*:?\\s+(" + CC_AMOUNT_PAT + ")", "i"));
+  return m ? ccTidyAmount(m[1]) : "";
+}
+
+function ccPercentField(text, labelPattern) {
+  var m = text.match(new RegExp(labelPattern + "\\s*:?\\s+([\\d.\\s]+\\s*%)", "i"));
+  return m ? m[1].replace(/\s+/g, "") : "";
+}
+
+/** "Aug 1 1" -> "Aug 11". Only touches the day, never the month. */
+function ccTidyDate(raw) {
+  var parts = raw.trim().split(/\s+/);
+  var month = parts.shift() || "";
+  return month + " " + parts.join("");
+}
+
+/** "$320.1 1" -> "$320.11", and any of -/− -> the en-dash real statements print. */
+function ccTidyAmount(raw) {
+  return raw.replace(/\s+/g, "").replace(/^[-−]/, "–");
+}
+
+function ccIsCredit(amount) { return /^[–\-−]/.test(amount); }
+
+function ccNumericAmount(amount) {
+  var n = Number(String(amount).replace(/[^\d.]/g, ""));
+  return isFinite(n) ? n : 0;
+}
+
+function ccFormatAmount(n) {
+  return "$" + n.toLocaleString("en-CA", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// ---- Bridge calls. See CustomCcStatement.gs; three actions because the bridge is
+// ---- GET-only and a full statement's activity does not fit in one query string.
+
+/** Rows per append call. Sized for URL length, not pagination — GAS decides pages. */
+var CC_ROWS_PER_CALL = 15;
+
+function createCcStatementViaBridge(fields) {
+  var params = {};
+  Object.keys(fields).forEach(function(k) {
+    params[k] = fields[k] == null ? "" : String(fields[k]);
+  });
+  return callBridgeViaIframe("createCcStatement", params, "ccStatementCreated", 90000)
+    .then(function(d) {
+      if (d.ok === false) throw new Error(d.error || "Bridge could not create the statement");
+      var res = d.result || {};
+      if (!res.docId) throw new Error("Bridge returned no statement Doc.");
+      return res;
+    });
+}
+
+/** `startIndex` is the row's position in the WHOLE statement, not in this batch. */
+function appendCcStatementRowsViaBridge(docId, startIndex, totalRows, rows) {
+  var params = { docId: docId, startIndex: String(startIndex), totalRows: String(totalRows) };
+  rows.forEach(function(row, i) {
+    var fields = [row.transDate, row.postedDate, row.type, row.details, row.amount]
+      .map(ccStripRowDelimiters);
+    // Only after stripping, or the strip would eat the marker just inserted.
+    fields[3] = fields[3].replace(/\n/g, CC_NEWLINE_MARKER);
+    params["r" + i] = fields.join("|");
+  });
+  return callBridgeViaIframe("appendCcStatementRows", params, "ccStatementRowsAppended", 120000)
+    .then(function(d) {
+      if (d.ok === false) throw new Error(d.error || "Bridge could not append activity rows");
+      return d.result || {};
+    });
+}
+
+function finalizeCcStatementViaBridge(docId) {
+  return callBridgeViaIframe("finalizeCcStatement", { docId: docId }, "ccStatementFinalized", 120000)
+    .then(function(d) {
+      if (d.ok === false) throw new Error(d.error || "Bridge could not export the statement PDF");
+      var res = d.result || {};
+      if (!res.pdfUrl) throw new Error("Bridge returned no statement PDF.");
+      return res;
+    });
+}
+
+/** "|" separates a row's fields and U+23CE marks its line break, so neither can survive
+ *  inside a value. Neither appears in real statement text; this is belt-and-braces. */
+function ccStripRowDelimiters(value) {
+  return String(value == null ? "" : value).split("|").join("/").split(CC_NEWLINE_MARKER).join(" ");
 }
 
 // ============ INQUIRY REMOVAL (TransUnion) — doc create + PDF email via bridge ============

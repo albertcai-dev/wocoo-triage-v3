@@ -337,6 +337,502 @@ function TranscriptParserModal(props){
 }
 
 // ============ INQUIRY REMOVAL MODAL (TransUnion credit-inquiry removal letter) ============
+// ============ MOBILE CHEQUE VALIDATION TAB ============
+// Ported from the extension's MobileChequeValidation.tsx. Apps Script does the Gmail +
+// Sheet + totals work; this renders the record and ships the Slack digest through the
+// bridge. See the notes in app-core.js for why the webhook is relayed rather than POSTed.
+//
+// Note: this file has no useMemo (app-data.js exposes only useState/useCallback/useEffect),
+// so derived values are computed inline on each render. They are all cheap.
+
+function MobileChequeValidationTab(){
+  var _rec=useState(null),record=_rec[0],setRecord=_rec[1];
+  var _ld=useState(false),loading=_ld[0],setLoading=_ld[1];
+  var _bt=useState(false),booted=_bt[0],setBooted=_bt[1];
+  var _ov=useState(false),overrideAsReady=_ov[0],setOverrideAsReady=_ov[1];
+  var _tx=useState(""),text=_tx[0],setText=_tx[1];
+  var _tp=useState(""),textFor=_tp[0],setTextFor=_tp[1]; // which template `text` was built from
+  var _sd=useState(false),sending=_sd[0],setSending=_sd[1];
+  var _cf=useState(false),confirming=_cf[0],setConfirming=_cf[1];
+  var _sn=useState(false),sent=_sn[0],setSent=_sn[1];
+  var _cp=useState(false),copied=_cp[0],setCopied=_cp[1];
+  var _er=useState(null),err=_er[0],setErr=_er[1];
+  // Who may trigger the pipeline. The bridge is deployed "Execute as: User accessing the
+  // web app", so a run executes as whoever clicked — and `runMobileChequeValidation`
+  // reads Gmail. A non-owner either lacks the Gmail scope or has the wrong mailbox, and
+  // either way its failure is cached into SCRIPT properties, replacing the record every
+  // client reads. So the bridge decides, and non-owners get no button.
+  // null = deployed bridge predates the guard; treat as "allowed" to stay backwards-compatible.
+  var _cr=useState(null),canRun=_cr[0],setCanRun=_cr[1];
+
+  // Read the cached record once per mount. The bridge iframe is hidden, so this is
+  // invisible — but it still costs a round-trip, hence the `booted` guard.
+  useEffect(function(){
+    if(booted)return;
+    setBooted(true);
+    setLoading(true);setErr(null);
+    getMcvStatusViaBridge().then(function(s){
+      setRecord(s.record);
+      setCanRun(s.canRun);
+      if(s.record&&s.record.sentAt)setSent(true);
+    }).catch(function(e){setErr(e&&e.message?e.message:String(e))})
+      .then(function(){setLoading(false)});
+  },[booted]);
+
+  var runNow=function(){
+    setLoading(true);setErr(null);setSent(false);
+    runMcvViaBridge().then(function(rec){
+      setRecord(rec);
+      if(rec&&rec.sentAt)setSent(true);
+    }).catch(function(e){setErr(e&&e.message?e.message:String(e))})
+      .then(function(){setLoading(false)});
+  };
+
+  var isAnomaly=record?record.status==="anomaly":false;
+  // Override: when the P/Q formula errors are confirmed to be sheet formulas breaking
+  // rather than cheques failing to process, send the clean Ready digest and bump
+  // processedCount by that row count so it reads "75/75" instead of "75/74". Other
+  // anomaly kinds don't shift totals and are unaffected.
+  var pqErrorCount=(function(){
+    if(!record)return 0;
+    var a=(record.anomalies||[]).find(function(x){return x.kind==="pq_errors"});
+    if(!a)return 0;
+    var m=String(a.detail||"").match(/^(\d+)/);
+    return m?parseInt(m[1],10):0;
+  })();
+  var effectiveIsAnomaly=isAnomaly&&!overrideAsReady;
+  var totals=record?record.totals:null;
+  var effectiveTotals=totals?Object.assign({},totals,{
+    processedCount:totals.processedCount+(overrideAsReady?pqErrorCount:0)
+  }):null;
+  var messageDateKey=mcvTodayKey();
+
+  // Rebuild the textarea whenever the underlying template flips. Manual edits made
+  // against the previous template are dropped, same as the extension.
+  var templateKey=record?(effectiveIsAnomaly?"anomaly":"ready")+":"+(effectiveTotals?effectiveTotals.processedCount:"")+":"+messageDateKey:"";
+  useEffect(function(){
+    if(!record||templateKey===textFor)return;
+    setText(effectiveIsAnomaly
+      ? buildMcvAnomalyDM(messageDateKey,record.anomalies||[])
+      : buildMcvMessage(messageDateKey,effectiveTotals));
+    setTextFor(templateKey);
+  },[templateKey]);
+
+  var doSend=function(){
+    setConfirming(false);setSending(true);setErr(null);
+    var call=effectiveIsAnomaly
+      ? sendMcvWebhookViaBridge("anomaly",{mcv_body:text})
+      : sendMcvWebhookViaBridge("ready",{
+          mcv_date:formatMcvDate(messageDateKey),
+          received:String(effectiveTotals.receivedCount),
+          processed:String(effectiveTotals.processedCount),
+          day1:String(effectiveTotals.day1Reversed),
+          ops_breach:String(effectiveTotals.opsSlaBreach),
+          risk_breach:String(effectiveTotals.riskSlaBreach)
+        });
+    call.then(function(){
+      return markMcvSentViaBridge(record.date).catch(function(){ /* DM already sent */ });
+    }).then(function(){setSent(true)})
+      .catch(function(e){setErr(e&&e.message?e.message:String(e))})
+      .then(function(){setSending(false)});
+  };
+
+  var copy=function(){
+    try{navigator.clipboard.writeText(text);setCopied(true);setTimeout(function(){setCopied(false)},1600)}catch(e){}
+  };
+
+  var card={background:"#fff",border:"1px solid #e5e7eb",borderRadius:12,padding:16};
+  var statLabel={fontSize:10,color:"#6b7280",fontWeight:600,textTransform:"uppercase"};
+  var statValue={fontSize:22,fontWeight:700,color:"#111827"};
+
+  return <div style={{display:"flex",flexDirection:"column",gap:12,maxWidth:820}}>
+    <div style={Object.assign({},card,{display:"flex",alignItems:"flex-start",gap:12})}>
+      <span style={{fontSize:26,lineHeight:1}}>📋</span>
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{fontSize:15,fontWeight:700,color:"#111827"}}>Mobile Cheque Validation</div>
+        <div style={{fontSize:11,color:"#6b7280",marginTop:2,lineHeight:1.5}}>
+          Daily validation of mobile cheque deposit returns. Apps Script does the Gmail, Sheet and totals work — review the digest here, then send it to your Slack DMs and copy it into <strong>#{MCV_CHANNEL_NAME}</strong>.
+        </div>
+      </div>
+      {canRun===false
+        ? <span style={{padding:"6px 10px",background:"#f3f4f6",color:"#6b7280",borderRadius:8,fontSize:11,fontWeight:600,whiteSpace:"nowrap",lineHeight:1.4,textAlign:"right"}}>
+            Runs on a schedule<br/>View only
+          </span>
+        : <button onClick={runNow} disabled={loading||sending} style={{padding:"8px 14px",background:(loading||sending)?"#e5e7eb":"#4f46e5",color:(loading||sending)?"#6b7280":"#fff",border:"none",borderRadius:8,cursor:(loading||sending)?"wait":"pointer",fontWeight:600,fontSize:12,whiteSpace:"nowrap"}}>
+            {loading?"…":(record?"↻ Re-run":"Run now")}
+          </button>}
+    </div>
+
+    {err?<div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:10,fontSize:12,color:"#991b1b",lineHeight:1.5}}>{err}</div>:null}
+
+    {!record&&!loading&&!err?<div style={Object.assign({},card,{fontSize:12,color:"#6b7280"})}>
+      {canRun===false
+        ? <span>No validation has run for the last business day yet. It runs automatically each morning — check back shortly, or ask Albert if it is still empty by mid-morning.</span>
+        : <span>No validation has run yet today. Click <strong>Run now</strong> to trigger it.</span>}
+    </div>:null}
+
+    {record?<div style={card}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <span style={{fontSize:13,fontWeight:700,color:"#111827"}}>{formatMcvDate(record.date)}</span>
+        <span style={{padding:"2px 8px",borderRadius:999,fontSize:10,fontWeight:700,
+          background:isAnomaly?"#fef2f2":"#f0fdf4",color:isAnomaly?"#991b1b":"#166534",
+          border:"1px solid "+(isAnomaly?"#fecaca":"#bbf7d0")}}>
+          {isAnomaly?"⚠ ANOMALY":"✓ READY"}
+        </span>
+        {sent?<span style={{fontSize:11,color:"#166534",fontWeight:600}}>· already sent</span>:null}
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:12}}>
+        <div><div style={statLabel}>Received</div><div style={statValue}>{effectiveTotals.receivedCount}</div></div>
+        <div><div style={statLabel}>Processed</div><div style={statValue}>{effectiveTotals.processedCount}</div></div>
+        <div><div style={statLabel}>Day 1 reversed</div><div style={statValue}>{effectiveTotals.day1Reversed}</div></div>
+        <div><div style={statLabel}>Ops SLA breach</div><div style={Object.assign({},statValue,{color:effectiveTotals.opsSlaBreach?"#b45309":"#111827"})}>{effectiveTotals.opsSlaBreach}</div></div>
+        <div><div style={statLabel}>Risk SLA breach</div><div style={Object.assign({},statValue,{color:effectiveTotals.riskSlaBreach?"#b45309":"#111827"})}>{effectiveTotals.riskSlaBreach}</div></div>
+      </div>
+
+      {(record.anomalies||[]).length?<div style={{marginBottom:12}}>
+        {record.anomalies.map(function(a,i){return <div key={i} style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,padding:8,fontSize:11,color:"#92400e",marginBottom:4,lineHeight:1.5}}>
+          <strong>{a.kind}</strong>: {a.detail}
+        </div>})}
+      </div>:null}
+
+      {(record.notes||[]).length?<div style={{marginBottom:12}}>
+        {record.notes.map(function(n,i){return <div key={i} style={{fontSize:11,color:"#6b7280",lineHeight:1.5}}>· {n}</div>})}
+      </div>:null}
+
+      {isAnomaly&&pqErrorCount>0?<label style={{display:"flex",alignItems:"flex-start",gap:8,fontSize:12,marginBottom:12,cursor:"pointer",background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:6,padding:8}}>
+        <input type="checkbox" checked={overrideAsReady} disabled={sending||sent} onChange={function(e){setOverrideAsReady(e.target.checked)}} style={{marginTop:2}}/>
+        <span style={{lineHeight:1.5}}>
+          Send as <strong>Ready</strong> anyway — the {pqErrorCount} P/Q error{pqErrorCount===1?"":"s"} are sheet formulas breaking, not cheques failing.
+          Bumps processed to <strong>{totals.processedCount+pqErrorCount}</strong>.
+        </span>
+      </label>:null}
+
+      <div style={{fontSize:11,color:"#6b7280",marginBottom:6,lineHeight:1.5}}>
+        {effectiveIsAnomaly
+          ? "Sends the text below as a Slack DM to you. Edit if needed, then copy from your DMs into the channel."
+          : "Sends a DM with the values below. The real DM renders with a bold first line and true @-mention pills for the 15 cc'd folks — those are baked into the workflow, so the preview can't show them. Copy from your DMs into the channel and the pills carry over."}
+      </div>
+      <textarea value={text} disabled={sending||sent} onChange={function(e){setText(e.target.value)}}
+        style={{width:"100%",boxSizing:"border-box",minHeight:190,padding:10,border:"1px solid #d1d5db",borderRadius:8,fontSize:12,fontFamily:"ui-monospace, SFMono-Regular, Menlo, monospace",lineHeight:1.6}}/>
+
+      <div style={{display:"flex",gap:8,alignItems:"center",marginTop:10,flexWrap:"wrap"}}>
+        {sent?
+          <span style={{fontSize:12,color:"#166534",fontWeight:600}}>✓ Sent to your Slack DMs — copy it into #{MCV_CHANNEL_NAME}</span>
+        :confirming?
+          <>
+            <span style={{fontSize:12,color:"#92400e"}}>Send this as a DM to yourself?</span>
+            <button onClick={doSend} style={{padding:"8px 14px",background:"#4f46e5",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontWeight:600,fontSize:12}}>Yes, send</button>
+            <button onClick={function(){setConfirming(false)}} style={{padding:"8px 14px",background:"#fff",border:"1px solid #d1d5db",borderRadius:8,cursor:"pointer",fontWeight:600,fontSize:12}}>Cancel</button>
+          </>
+        :
+          <button onClick={function(){setConfirming(true)}} disabled={sending} style={{padding:"8px 14px",background:sending?"#e5e7eb":(effectiveIsAnomaly?"#b45309":"#4f46e5"),color:sending?"#6b7280":"#fff",border:"none",borderRadius:8,cursor:sending?"wait":"pointer",fontWeight:600,fontSize:12}}>
+            {sending?"Sending…":(effectiveIsAnomaly?"Send anomaly DM":"Send digest DM")}
+          </button>
+        }
+        <button onClick={copy} style={{padding:"8px 14px",background:"#fff",border:"1px solid #d1d5db",borderRadius:8,cursor:"pointer",fontWeight:600,fontSize:12}}>
+          {copied?"✓ Copied":"Copy text"}
+        </button>
+      </div>
+    </div>:null}
+  </div>;
+}
+
+// ============ CUSTOM CC STATEMENT ============
+// Corrected credit card statement from the client's existing statement PDF.
+// Parsing happens in this tab (see ccExtractStatementText / ccParseStatement in
+// app-core.js); the Doc is built by CustomCcStatement.gs through the bridge.
+//
+// Unlike the extension's version of this workflow, a web page cannot read Atlas, so the
+// address fields prefill from the statement itself — i.e. with the WRONG address, the one
+// being corrected. They are labelled accordingly; the operator overwrites them.
+
+var CC_FIELD_DEFS = [
+  ["cardMasked","Credit card account"],["statementDate","Statement date"],
+  ["openingDate","Opening date"],["closingDate","Closing date"],
+  ["paymentDueDate","Payment due date"],["creditLimit","Credit limit"],
+  ["minimumPayment","Minimum payment"],["statementBalance","Statement balance"],
+  ["previousBalance","Previous balance"],["payments","Payments"],
+  ["otherCredits","Other credits"],["purchases","Purchases"],
+  ["fees","Fees"],["interest","Interest"],
+  ["cashAdvances","Cash advances"],["totalCharges","Total charges"],
+  ["totalPaymentsCredits","Total payments/credits"],["newBalance","New balance"],
+  ["annualInterestRate","Annual interest rate"],["cashAdvanceInterestRate","Cash advance interest rate"]
+];
+
+function CustomCcStatementModal(props){
+  var onClose=props.onClose, ticket=props.ticket||{};
+  var _st=useState("import"),st=_st[0],setSt=_st[1]; // import|parsing|review|generating|done|error
+  var _fn=useState(""),fileName=_fn[0],setFileName=_fn[1];
+  var _pg=useState(null),pages=_pg[0],setPages=_pg[1];
+  var _ps=useState(null),parsed=_ps[0],setParsed=_ps[1];
+  var _fl=useState({}),fields=_fl[0],setFields=_fl[1];
+  var _rw=useState([]),rows=_rw[0],setRows=_rw[1];
+  var _ad=useState({clientName:"",addressStreet:"",addressCityProvince:"",addressPostal:""}),addr=_ad[0],setAddr=_ad[1];
+  var _dg=useState(false),dragging=_dg[0],setDragging=_dg[1];
+  var _sr=useState(false),showRows=_sr[0],setShowRows=_sr[1];
+  var _pc=useState(true),postComment=_pc[0],setPostComment=_pc[1];
+  var _pr=useState(""),progress=_pr[0],setProgress=_pr[1];
+  var _dc=useState(null),doc=_dc[0],setDoc=_dc[1];
+  var _rs=useState(null),res=_rs[0],setRes=_rs[1];
+  var _wn=useState(null),warn=_wn[0],setWarn=_wn[1];
+  var _er=useState(null),err=_er[0],setErr=_er[1];
+
+  var setField=function(k,v){setFields(function(p){var n=Object.assign({},p);n[k]=v;return n})};
+  var setAddrField=function(k,v){setAddr(function(p){var n=Object.assign({},p);n[k]=v;return n})};
+
+  var onFile=function(file){
+    if(!file)return;
+    setFileName(file.name);setSt("parsing");setErr(null);setPages(null);
+    ccExtractStatementText(file).then(function(pp){
+      setPages(pp);
+      var s=ccParseStatement(pp);
+      setParsed(s);setRows(s.rows);
+      var f={};CC_FIELD_DEFS.forEach(function(d){f[d[0]]=s[d[0]]||""});
+      setFields(f);
+      // Prefill the identity block from the statement. This is the STALE address by
+      // definition — the operator corrects it before generating.
+      setAddr({
+        clientName:ccTitleCaseName(s.nameOnStatement||""),
+        addressStreet:(s.addressLines[0]||"").trim(),
+        addressCityProvince:ccSplitCityProvince(s.addressLines[1]||"").cityProvince,
+        addressPostal:ccSplitCityProvince(s.addressLines[1]||"").postal
+      });
+      setSt(s.rows.length?"review":"error");
+      if(!s.rows.length)setErr("Found no activity rows in that PDF. Either it is not a Wealthsimple credit card statement, or the layout changed and the parser needs updating.");
+    }).catch(function(e){setErr(e&&e.message?e.message:String(e));setSt("error")});
+  };
+
+  var periodLabel=(function(){
+    var m=(fields.statementDate||"").match(/^([A-Za-z]+)\s+\d{1,2},?\s*(\d{4})$/);
+    return m?m[1]+" "+m[2]:(fields.statementDate||"");
+  })();
+
+  var canGenerate=addr.clientName.trim()&&addr.addressStreet.trim()&&
+    addr.addressCityProvince.trim()&&addr.addressPostal.trim()&&
+    (fields.statementDate||"").trim()&&(fields.newBalance||"").trim()&&rows.length>0;
+
+  var generate=function(){
+    setSt("generating");setErr(null);setWarn(null);setDoc(null);
+    var payload=Object.assign({},fields,{
+      clientName:addr.clientName.trim(),
+      addressStreet:addr.addressStreet.trim(),
+      addressCityProvince:addr.addressCityProvince.trim(),
+      addressPostal:addr.addressPostal.trim(),
+      statementPeriodLabel:periodLabel,
+      wocooTicketId:ticket.id||""
+    });
+    setProgress("Copying the template…");
+    createCcStatementViaBridge(payload).then(function(created){
+      // The Doc exists from here on, so any later failure still surfaces its link rather
+      // than losing the work.
+      setDoc(created);
+      var chain=Promise.resolve();
+      for(var i=0;i<rows.length;i+=CC_ROWS_PER_CALL){
+        (function(start){
+          chain=chain.then(function(){
+            var batch=rows.slice(start,start+CC_ROWS_PER_CALL);
+            setProgress("Adding activity rows "+(start+1)+"–"+(start+batch.length)+" of "+rows.length+"…");
+            return appendCcStatementRowsViaBridge(created.docId,start,rows.length,batch);
+          });
+        })(i);
+      }
+      return chain.then(function(){
+        setProgress("Exporting the PDF…");
+        return finalizeCcStatementViaBridge(created.docId);
+      });
+    }).then(function(finalized){
+      setRes(finalized);
+      if(!postComment){setSt("done");setProgress("");return}
+      setProgress("Commenting on the ticket…");
+      return postCommentViaBridge(ticket.id,
+        "Corrected credit card statement generated for "+addr.clientName.trim()+
+        " ("+periodLabel+"). Doc: "+finalized.docUrl
+      ).then(function(){setSt("done");setProgress("")})
+       .catch(function(e){
+         setWarn("Statement created, but the Jira comment failed: "+(e&&e.message?e.message:String(e)));
+         setSt("done");setProgress("");
+       });
+    }).catch(function(e){
+      setErr(e&&e.message?e.message:String(e));setSt("error");setProgress("");
+    });
+  };
+
+  var overlay={position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20};
+  var card={background:"#fff",borderRadius:12,maxWidth:720,width:"100%",maxHeight:"90vh",overflowY:"auto",border:"2px solid #4f46e5",color:"#1f2937"};
+  var sec={padding:"14px 20px",borderBottom:"1px solid #f3f4f6"};
+  var lblText={display:"block",fontSize:11,color:"#6b7280",fontWeight:600,marginBottom:3};
+  var inp={width:"100%",boxSizing:"border-box",padding:"6px 10px",border:"1px solid #d1d5db",borderRadius:6,fontSize:12};
+  var busy=st==="parsing"||st==="generating";
+
+  return <div style={overlay} onClick={function(e){if(e.target===e.currentTarget&&!busy)onClose()}}>
+    <div style={card} onClick={function(e){e.stopPropagation()}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 20px",borderBottom:"1px solid #e5e7eb"}}>
+        <h2 style={{margin:0,fontSize:16}}>🧾 Custom CC Statement{ticket.id?<span style={{fontSize:12,color:"#6b7280",fontWeight:400}}> · {ticket.id}</span>:null}</h2>
+        <button onClick={onClose} disabled={busy} style={{background:"none",border:"none",fontSize:20,cursor:busy?"not-allowed":"pointer",color:"#9ca3af"}}>×</button>
+      </div>
+      {err?<div style={{margin:"10px 20px",background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:8,fontSize:12,color:"#991b1b"}}>{err}</div>:null}
+      {warn?<div style={{margin:"10px 20px",background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:8,fontSize:12,color:"#92400e"}}>⚠ {warn}</div>:null}
+
+      {st!=="done"?<div style={sec}>
+        <strong style={{display:"block",marginBottom:8,fontSize:13}}>1 · Import the client's statement PDF</strong>
+        {/* The input is wrapped in the label rather than driven by a ref — clicking the
+            label opens the picker natively, and useRef is not in scope in this file. */}
+        <label
+          onDragOver={function(e){e.preventDefault();if(!busy)setDragging(true)}}
+          onDragLeave={function(){setDragging(false)}}
+          onDrop={function(e){e.preventDefault();setDragging(false);if(!busy)onFile(e.dataTransfer.files&&e.dataTransfer.files[0])}}
+          style={{display:"block",padding:"22px 16px",textAlign:"center",
+            border:"1.5px dashed "+(dragging?"#4f46e5":"#d1d5db"),borderRadius:10,
+            background:dragging?"#eef2ff":"#f9fafb",
+            cursor:busy?"not-allowed":"pointer",opacity:busy?0.6:1,transition:"background 0.15s, border-color 0.15s"}}
+        >
+          <div style={{fontSize:22,marginBottom:4}}>🧾</div>
+          <div style={{fontSize:13,fontWeight:600,color:"#111827"}}>
+            {st==="parsing"?"Parsing…":(fileName?"Choose a different PDF":"Drop the statement PDF, or click to pick")}
+          </div>
+          <div style={{fontSize:11,color:"#9ca3af",marginTop:4,lineHeight:1.5}}>
+            Parsed in this tab — the file is never uploaded anywhere.
+          </div>
+          <input type="file" accept="application/pdf,.pdf" disabled={busy}
+            onChange={function(e){onFile(e.target.files&&e.target.files[0])}}
+            style={{display:"none"}}/>
+        </label>
+        {fileName?<div style={{fontSize:11,color:"#6b7280",marginTop:6}}>📄 {fileName}</div>:null}
+        {parsed&&rows.length?<div style={{fontSize:12,color:"#166534",marginTop:6}}>✓ Parsed {rows.length} activity rows across {pages?pages.length:0} pages</div>:null}
+      </div>:null}
+
+      {parsed&&rows.length&&st!=="done"?<div style={sec}>
+        <strong style={{display:"block",marginBottom:6,fontSize:13}}>2 · Check the parsed statement</strong>
+        {parsed.warnings.length?
+          parsed.warnings.map(function(w,i){return <div key={i} style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,padding:6,fontSize:11,color:"#92400e",marginBottom:4}}>⚠ {w}</div>})
+          :<div style={{fontSize:11,color:"#166534",marginBottom:6}}>✓ No parser warnings — activity totals reconcile with the summary</div>}
+        <div style={{fontSize:11,color:"#9ca3af",marginBottom:8,lineHeight:1.5}}>
+          Copied from the client's statement as-is. Only the address is being corrected — if a number here is wrong, this is the wrong tool.
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          {CC_FIELD_DEFS.map(function(d){return <div key={d[0]}>
+            <label style={lblText}>{d[1]}</label>
+            <input type="text" value={fields[d[0]]||""} disabled={busy} onChange={function(e){setField(d[0],e.target.value)}} style={inp}/>
+          </div>})}
+        </div>
+        <button onClick={function(){setShowRows(!showRows)}} style={{marginTop:10,padding:"6px 12px",background:"#f3f4f6",border:"1px solid #d1d5db",borderRadius:6,cursor:"pointer",fontSize:11,fontWeight:600}}>
+          {showRows?"▾":"▸"} {rows.length} activity rows
+        </button>
+        {showRows?<div style={{maxHeight:240,overflowY:"auto",border:"1px solid #e5e7eb",borderRadius:6,marginTop:8}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:10}}>
+            <tbody>
+              {rows.map(function(r,i){return <tr key={i} style={{borderTop:i?"1px solid #f3f4f6":"none"}}>
+                <td style={{padding:"3px 6px",verticalAlign:"top"}}>{r.transDate}</td>
+                <td style={{padding:"3px 6px",verticalAlign:"top"}}>{r.postedDate}</td>
+                <td style={{padding:"3px 6px",verticalAlign:"top"}}>{r.type}</td>
+                <td style={{padding:"3px 6px",verticalAlign:"top",whiteSpace:"pre-wrap"}}>{r.details}</td>
+                <td style={{padding:"3px 6px",verticalAlign:"top",textAlign:"right"}}>{r.amount}</td>
+              </tr>})}
+            </tbody>
+          </table>
+        </div>:null}
+      </div>:null}
+
+      {parsed&&rows.length&&st!=="done"?<div style={sec}>
+        <strong style={{display:"block",marginBottom:6,fontSize:13}}>3 · Correct the address</strong>
+        <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:6,padding:8,fontSize:11,color:"#991b1b",marginBottom:8,lineHeight:1.5}}>
+          These are prefilled from the statement, so they hold the <strong>outdated</strong> details the client is complaining about. Overwrite them with the correct ones.
+          {ticket.identityId?<span> <a href={"https://atlas.wealthsimple.com/identity/"+ticket.identityId+"/overview/?ticketId="+(ticket.id||"")} target="_blank" rel="noreferrer" style={{color:"#4f46e5",fontWeight:700}}>Open Atlas ↗</a></span>:null}
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div style={{gridColumn:"1 / -1"}}>
+            <label style={lblText}>Client full legal name</label>
+            <input type="text" value={addr.clientName} disabled={busy} onChange={function(e){setAddrField("clientName",e.target.value)}} style={inp}/>
+          </div>
+          <div style={{gridColumn:"1 / -1"}}>
+            <label style={lblText}>Street (incl. unit)</label>
+            <input type="text" value={addr.addressStreet} disabled={busy} onChange={function(e){setAddrField("addressStreet",e.target.value)}} style={inp}/>
+          </div>
+          <div>
+            <label style={lblText}>City, Province</label>
+            <input type="text" value={addr.addressCityProvince} disabled={busy} onChange={function(e){setAddrField("addressCityProvince",e.target.value)}} style={inp}/>
+          </div>
+          <div>
+            <label style={lblText}>Postal code</label>
+            <input type="text" value={addr.addressPostal} disabled={busy} onChange={function(e){setAddrField("addressPostal",e.target.value)}} style={inp}/>
+          </div>
+        </div>
+        <div style={{fontSize:11,color:"#9ca3af",marginTop:6,lineHeight:1.5}}>
+          Template conventions: title-case name, province spelled out (“Ontario”, not “ON”), postal code with a space.
+        </div>
+      </div>:null}
+
+      {parsed&&rows.length&&st!=="done"?<div style={sec}>
+        <strong style={{display:"block",marginBottom:6,fontSize:13}}>4 · Generate</strong>
+        {ticket.id?<label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,marginBottom:8,cursor:"pointer"}}>
+          <input type="checkbox" checked={postComment} disabled={busy} onChange={function(e){setPostComment(e.target.checked)}}/>
+          Comment the Doc link on {ticket.id}
+        </label>:null}
+        <button onClick={generate} disabled={!canGenerate||busy} style={{padding:"8px 16px",background:(!canGenerate||busy)?"#d1d5db":"#4f46e5",color:"#fff",border:"none",borderRadius:8,cursor:(!canGenerate||busy)?"not-allowed":"pointer",fontWeight:600,fontSize:13}}>
+          {st==="generating"?"Generating…":"Generate statement + PDF"}
+        </button>
+        {progress?<div style={{fontSize:12,color:"#4f46e5",marginTop:8}}>{progress}</div>:null}
+        {!canGenerate?<div style={{fontSize:11,color:"#9ca3af",marginTop:6}}>Name, full address, statement date and new balance are required.</div>:null}
+        <div style={{fontSize:11,color:"#9ca3af",marginTop:6,lineHeight:1.5}}>
+          Creates “{addr.clientName||"Client"} | Credit Card Statement {periodLabel}” in Drive and exports a PDF.
+        </div>
+        {st==="error"&&doc?<div style={{marginTop:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,padding:8,fontSize:11,color:"#92400e",lineHeight:1.5}}>
+          The Doc was created before this failed, so nothing is lost — <a href={doc.docUrl} target="_blank" rel="noreferrer" style={{color:"#4f46e5",fontWeight:700}}>open it ↗</a> and finish by hand rather than re-running.
+        </div>:null}
+      </div>:null}
+
+      {st==="done"&&res?<div style={sec}>
+        <div style={{fontSize:13,color:"#166534",fontWeight:700,marginBottom:8}}>✓ Statement generated</div>
+        <div style={{fontSize:12,color:"#6b7280",marginBottom:8}}>{res.fileName}</div>
+        <div style={{display:"flex",gap:8,marginBottom:10}}>
+          <a href={res.docUrl} target="_blank" rel="noreferrer" style={{padding:"8px 14px",background:"#4f46e5",color:"#fff",borderRadius:8,fontSize:12,fontWeight:600,textDecoration:"none"}}>Open Doc ↗</a>
+          <a href={res.pdfUrl} target="_blank" rel="noreferrer" style={{padding:"8px 14px",background:"#fff",color:"#1f2937",border:"1px solid #d1d5db",borderRadius:8,fontSize:12,fontWeight:600,textDecoration:"none"}}>Open PDF ↗</a>
+        </div>
+        <div style={{background:"#f9fafb",border:"1px solid #e5e7eb",borderRadius:8,padding:10,fontSize:11,color:"#374151",lineHeight:1.7}}>
+          <strong>Still manual:</strong>
+          <div>1. Open the Doc and eyeball the page breaks.</div>
+          <div>2. Check the disclosure page names the client's actual card variant.</div>
+          <div>3. Upload the PDF to Atlas under the client's profile, document type “Other”.</div>
+          <div>4. Send the Atlas access macro to the client.</div>
+        </div>
+      </div>:null}
+
+      <div style={{padding:"12px 20px",display:"flex",justifyContent:"flex-end"}}>
+        <button onClick={onClose} disabled={busy} style={{padding:"8px 16px",background:"#fff",border:"1px solid #d1d5db",borderRadius:8,cursor:busy?"not-allowed":"pointer",fontSize:12,fontWeight:600}}>
+          {st==="done"?"Close":"Cancel"}
+        </button>
+      </div>
+    </div>
+  </div>;
+}
+
+/** Statements print names in caps; the template convention is title case. Mixed-case
+ *  names (McDonald, van Dijk) are left alone. */
+function ccTitleCaseName(raw){
+  var name=(raw||"").replace(/\s+/g," ").trim();
+  if(!name)return name;
+  if(name!==name.toLowerCase()&&name!==name.toUpperCase())return name;
+  return name.toLowerCase().replace(/(^|[\s'’-])([a-z])/g,function(m,sep,ch){return sep+ch.toUpperCase()});
+}
+
+var CC_PROVINCE_NAMES={AB:"Alberta",BC:"British Columbia",MB:"Manitoba",NB:"New Brunswick",
+  NL:"Newfoundland and Labrador",NS:"Nova Scotia",NT:"Northwest Territories",NU:"Nunavut",
+  ON:"Ontario",PE:"Prince Edward Island",QC:"Quebec",SK:"Saskatchewan",YT:"Yukon"};
+
+/** "MONTREAL QC H2Y 1Z5" -> { cityProvince: "Montreal, Quebec", postal: "H2Y 1Z5" }.
+ *  The template spells the province out and spaces the postal code. */
+function ccSplitCityProvince(line){
+  var raw=(line||"").replace(/\s+/g," ").trim();
+  if(!raw)return {cityProvince:"",postal:""};
+  var m=raw.match(/^(.*?)[,\s]+([A-Za-z]{2})[,\s]+([A-Za-z]\d[A-Za-z]\s?\d[A-Za-z]\d)$/);
+  if(!m)return {cityProvince:raw,postal:""};
+  var city=ccTitleCaseName(m[1].replace(/,$/,""));
+  var prov=CC_PROVINCE_NAMES[m[2].toUpperCase()]||m[2];
+  var postal=m[3].toUpperCase().replace(/\s+/g,"");
+  return {cityProvince:city+", "+prov,postal:postal.slice(0,3)+" "+postal.slice(3)};
+}
+
 function InquiryRemovalModal(props){
   var onClose=props.onClose;
   var _f=useState({firstName:"",lastName:"",address:"",city:"",postalCode:"",dob:"",phone:"",dateOfInquiry:"",associate:props.associate||""}),f=_f[0],setF=_f[1];
@@ -456,11 +952,14 @@ var FRAUD_BACK_OFFICE_TRANSITION_ID = "121"; // WOCOO "Request reviewed" -> Back
 
 // ============ MAIN OVERPAYMENT TRIAGE WORKFLOW (Atlassian → MCPLocker) ============
 function TriageWorkflow(props){var ticket=props.ticket,onClose=props.onClose;
-  var _smr=useState(false),showManualReimbInput=_smr[0],setShowManualReimbInput=_smr[1];var _mrk=useState(""),manualReimbKey=_mrk[0],setManualReimbKey=_mrk[1];var _fti=useState(null),fraudTicketId=_fti[0],setFraudTicketId=_fti[1];var _smf=useState(false),showManualFraudInput=_smf[0],setShowManualFraudInput=_smf[1];var _mfk=useState(""),manualFraudKey=_mfk[0],setManualFraudKey=_mfk[1];var _dm=useState(FRAUD_DETECTION_METHOD_LABEL),detectionMethod=_dm[0],setDetectionMethod=_dm[1];var _lfk=useState([]),linkedFraudKeys=_lfk[0],setLinkedFraudKeys=_lfk[1];var _lcs=useState("idle"),linkCheck=_lcs[0],setLinkCheck=_lcs[1];var _lce=useState(null),linkCheckError=_lce[0],setLinkCheckError=_lce[1];var _fby=useState(false),fraudBypass=_fby[0],setFraudBypass=_fby[1];
+  var _smr=useState(false),showManualReimbInput=_smr[0],setShowManualReimbInput=_smr[1];var _mrk=useState(""),manualReimbKey=_mrk[0],setManualReimbKey=_mrk[1];var _fti=useState(null),fraudTicketId=_fti[0],setFraudTicketId=_fti[1];var _smf=useState(false),showManualFraudInput=_smf[0],setShowManualFraudInput=_smf[1];var _mfk=useState(""),manualFraudKey=_mfk[0],setManualFraudKey=_mfk[1];var _dm=useState(FRAUD_DETECTION_METHOD_LABEL),detectionMethod=_dm[0],setDetectionMethod=_dm[1];var _lfk=useState([]),linkedFraudKeys=_lfk[0],setLinkedFraudKeys=_lfk[1];var _lcs=useState("idle"),linkCheck=_lcs[0],setLinkCheck=_lcs[1];var _lce=useState(null),linkCheckError=_lce[0],setLinkCheckError=_lce[1];var _fby=useState(null),fraudBypass=_fby[0],setFraudBypass=_fby[1];var _cfb=useState(false),confirmBypass=_cfb[0],setConfirmBypass=_cfb[1];
   var _st=useState(0),step=_st[0],setStep=_st[1];var _ld=useState(false),loading=_ld[0],setLoading=_ld[1];var _er=useState(null),error=_er[0],setError=_er[1];var _fd=useState(ticket.description||""),fetchedDesc=_fd[0],setFetchedDesc=_fd[1];var _iid=useState(extractIdentityId(ticket.description)),identityId=_iid[0],setIdentityId=_iid[1];var _am=useState(extractAmount(ticket.description)),amount=_am[0],setAmount=_am[1];var _ai=useState(""),accountId=_ai[0],setAccountId=_ai[1];var _ri=useState(null),reimTicketId=_ri[0],setReimTicketId=_ri[1];var _cp=useState(false),commentPosted=_cp[0],setCommentPosted=_cp[1];var _bv=useState(false),balanceVerified=_bv[0],setBalanceVerified=_bv[1];var _tm=useState(false),ticketMoved=_tm[0],setTicketMoved=_tm[1];var _sa=useState(false),showAmountAdjust=_sa[0],setShowAmountAdjust=_sa[1];var _aa=useState(null),adjustedAmount=_aa[0],setAdjustedAmount=_aa[1];var _ad=useState(false),adminDebitDone=_ad[0],setAdminDebitDone=_ad[1];var _mi=useState(""),manualIdentityId=_mi[0],setManualIdentityId=_mi[1];var _ma=useState(""),manualAmount=_ma[0],setManualAmount=_ma[1];var _so=useState(false),showAmountOverride=_so[0],setShowAmountOverride=_so[1];var _ut=useState(null),userTier=_ut[0],setUserTier=_ut[1];var _ui=useState(null),userTierId=_ui[0],setUserTierId=_ui[1];var _se=useState(false),showTierEdit=_se[0],setShowTierEdit=_se[1];var _ct=useState(""),commentText=_ct[0],setCommentText=_ct[1];var _ec=useState(false),editingComment=_ec[0],setEditingComment=_ec[1];var _dt=useState(""),declineText=_dt[0],setDeclineText=_dt[1];var _dp=useState(false),declinePosted=_dp[0],setDeclinePosted=_dp[1];var _rp=useState(""),reporter=_rp[0],setReporter=_rp[1];var _mapp=useState(null),manualApprover=_mapp[0],setManualApprover=_mapp[1];var _sae=useState(false),showApproverEdit=_sae[0],setShowApproverEdit=_sae[1];var _sae2=useState(false),showApproverEdit2=_sae2[0],setShowApproverEdit2=_sae2[1];var _ce=useState(""),clientEmail=_ce[0],setClientEmail=_ce[1];var _ec=useState(false),emailCopied=_ec[0],setEmailCopied=_ec[1];
   var isCCOvpType=(ticket.type||"").toLowerCase().indexOf("credit card: overpayment")!==-1;var approver=manualApprover||(amount&&amount>=5000?APPROVERS.amanda:APPROVERS.luke);var meetsMinimum=amount&&amount>=1000;var overFraudThreshold=!!(amount&&amount>FRAUD_AMOUNT_THRESHOLD);
-  // A FRAUD ticket was already raised on a PRIOR pass (auto-detected link, or manual
-  // bypass) => the >$10k gate is satisfied, so run the normal REIMB path. Deliberately
+  // The >$10k fraud gate can be satisfied without creating a FRAUD ticket here, two ways:
+  // a ticket was already raised on a PRIOR pass (auto-detected link, or the operator
+  // confirmed one exists after a failed link check => fraudBypass==="exists"), or the
+  // operator judged no fraud review is needed at all (fraudBypass==="skipped"). Both run
+  // the normal REIMB path. Deliberately
   // ignores fraudTicketId: a FRAUD ticket created in THIS session must still finish the
   // escalation path (comment -> Back Office), not fall through to a reimbursement.
   var priorFraudKey=linkedFraudKeys[0]||null;
@@ -617,8 +1116,8 @@ function TriageWorkflow(props){var ticket=props.ticket,onClose=props.onClose;
     <div style={sec}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><strong style={{fontSize:13}}>Step 1: Pull Ticket from JIRA</strong>{step>=1?chk:<button onClick={fetchTicket} disabled={loading} style={loading?btnOff:btn}>{loading?"Fetching…":"Fetch Ticket"}</button>}</div>{step>=1?<div style={{marginTop:8,fontSize:12,background:"#fff",padding:8,borderRadius:6,border:"1px solid #e5e7eb"}}><div>Identity ID: {identityId?<strong style={{color:"#4f46e5"}}>{identityId}</strong>:<span style={{color:"#d97706"}}>Not found</span>}</div>{!identityId?<div style={{marginTop:4}}><input type="text" value={manualIdentityId} onChange={function(e){setManualIdentityId(e.target.value)}} placeholder="Enter Identity ID" style={{padding:"4px 8px",border:"1px solid #d1d5db",borderRadius:6,fontSize:11,width:260,fontFamily:"monospace"}}/><button onClick={function(){if(manualIdentityId.trim())setIdentityId(manualIdentityId.trim())}} disabled={!manualIdentityId.trim()} style={Object.assign({},btn,{fontSize:11,padding:"4px 10px",marginLeft:6})}>Set</button></div>:null}<div style={{marginTop:4}}>Amount: <strong style={{color:"#dc2626"}}>{amount&&!isNaN(amount)?fmtAmt(amount):"Not found"}</strong>{isCCOvpType&&amount?<span style={{fontSize:10,color:"#4f46e5",marginLeft:6}}>(JIRA field)</span>:null}{!showAmountOverride?<button onClick={function(){setShowAmountOverride(true)}} style={{marginLeft:8,background:"none",border:"none",color:"#d97706",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline"}}>✏️ Override</button>:null}</div>{showAmountOverride?<div style={{marginTop:4,padding:8,background:"#fffbeb",borderRadius:6,border:"1px solid #fde68a"}}><div style={{display:"flex",gap:6,alignItems:"center"}}><span>$</span><input type="number" step="0.01" value={manualAmount} onChange={function(e){setManualAmount(e.target.value)}} placeholder="1000.00" style={{padding:"4px 8px",border:"1px solid #fde68a",borderRadius:6,fontSize:12,width:120,fontFamily:"monospace"}}/><button onClick={function(){if(manualAmount&&parseFloat(manualAmount)>0){setAmount(parseFloat(manualAmount));setShowAmountOverride(false)}}} style={Object.assign({},btn,{background:"#d97706",fontSize:11,padding:"4px 10px"})}>Set</button></div></div>:null}<div style={{marginTop:4,fontSize:11,color:"#6b7280",fontStyle:"italic"}}>{(fetchedDesc||"").substring(0,200)}</div></div>:null}</div>
     {step>=1?<div style={sec}><strong style={{fontSize:13}}>Step 2: Acceptance Criteria</strong><div style={{marginTop:6,fontSize:12}}><div style={{marginBottom:4}}>{meetsMinimum?"✓":"⚠"} Amount ≥ $1,000: <strong>{fmtAmt(amount)}</strong>{!meetsMinimum&&amount?<span style={{color:"#d97706",marginLeft:4}}>(exception required)</span>:null}</div><div style={{marginBottom:4}}>✓ Tier: <strong>{userTier||"Unknown"}</strong></div><div>ℹ Approver: <strong>{approver.name}</strong> ({amount&&amount>=5000?"≥$5K":"<$5K"}) {!showApproverEdit2?<button onClick={function(){setShowApproverEdit2(true)}} style={{marginLeft:8,background:"none",border:"none",color:"#d97706",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline"}}>✏️ Override</button>:null}</div>{showApproverEdit2?<div style={{marginTop:4,padding:8,background:"#fffbeb",borderRadius:6,border:"1px solid #fde68a"}}><div style={{display:"flex",gap:6}}>{[APPROVERS.luke,APPROVERS.amanda].map(function(a){return <button key={a.accountId} onClick={function(){setManualApprover(a);setShowApproverEdit2(false)}} style={{padding:"4px 12px",borderRadius:6,fontSize:11,fontWeight:600,cursor:"pointer",background:approver.accountId===a.accountId?"#d97706":"#fff",color:approver.accountId===a.accountId?"#fff":"#d97706",border:"1px solid #fde68a"}}>{a.name}</button>})}</div></div>:null}</div>{!meetsMinimum&&amount&&step===1&&!declinePosted?<div style={{marginTop:10,background:"#fffbeb",borderRadius:8,padding:12,border:"1px solid #fde68a"}}><div style={{fontSize:12,fontWeight:600,color:"#92400e",marginBottom:6}}>📝 Decline Comment:</div><textarea value={declineText} onChange={function(e){setDeclineText(e.target.value)}} rows={5} style={{width:"100%",boxSizing:"border-box",padding:10,border:"1px solid #fde68a",borderRadius:6,fontSize:12,lineHeight:1.6,resize:"vertical",background:"#fff"}}/></div>:null}{declinePosted?<div style={{marginTop:8,fontSize:12,color:"#16a34a",fontWeight:600}}>✓ Decline comment posted</div>:null}{step===1?<div style={{display:"flex",gap:8,marginTop:8,flexWrap:"wrap"}}>{!meetsMinimum&&amount&&!declinePosted?<button onClick={postDeclineComment} disabled={loading} style={loading?btnOff:{padding:"8px 16px",background:"#dc2626",color:"#fff",border:"none",borderRadius:8,cursor:"pointer",fontWeight:600,fontSize:12}}>{loading?"Posting…":"✉️ Decline & Comment"}</button>:null}<button onClick={function(){setStep(2)}} style={Object.assign({},btn,{background:meetsMinimum?"#4f46e5":"#d97706"})}>{meetsMinimum?"Criteria Met → Continue":"Proceed as Exception → Continue"}</button></div>:null}</div>:null}
     {step>=2?<div style={sec}><strong style={{fontSize:13}}>Step 3: Verify Balance in MCP/Preset</strong><div style={{marginTop:8,display:"flex",gap:8,flexWrap:"wrap"}}><a href={presetUrl} target="_blank" rel="noreferrer" style={{display:"inline-block",padding:"8px 14px",background:"#eef2ff",color:"#4f46e5",borderRadius:8,textDecoration:"none",fontWeight:600,fontSize:12,border:"1px solid #c7d2fe"}}>📊 Open Preset</a><a href={"https://atlas.wealthsimple.com/identity/"+(identityId||"")+"/overview/?ticketId="+ticket.id} target="_blank" rel="noreferrer" style={{display:"inline-block",padding:"8px 14px",background:"#f0fdf4",color:"#16a34a",borderRadius:8,textDecoration:"none",fontWeight:600,fontSize:12,border:"1px solid #bbf7d0"}}>🔍 Open Atlas</a><a href="https://wealthsimplecs.mycardplace.com/customerservice/wealthsimplelogin.jsp" target="_blank" rel="noreferrer" style={{display:"inline-block",padding:"8px 14px",background:"#fffbeb",color:"#d97706",borderRadius:8,textDecoration:"none",fontWeight:600,fontSize:12,border:"1px solid #fde68a"}}>💳 Open MCP</a></div>{identityId?<div style={{marginTop:6,fontSize:11,color:"#6b7280"}}>Filter by: <code style={{background:"#f3f4f6",padding:"2px 6px",borderRadius:4,fontFamily:"monospace",userSelect:"all"}}>{identityId}</code></div>:null}{!balanceVerified?<div style={{marginTop:8}}><div style={{display:"flex",gap:8,flexWrap:"wrap"}}><button onClick={function(){setBalanceVerified(true);setStep(3)}} style={btn}>✓ Verified</button><button onClick={function(){setShowAmountAdjust(true)}} style={Object.assign({},btn,{background:"#d97706"})}>✏️ Balance Differs</button></div>{showAmountAdjust?<div style={{marginTop:8,padding:10,background:"#fff",borderRadius:6,border:"1px solid #fde68a"}}><div style={{display:"flex",gap:8,alignItems:"center"}}><span>-$</span><input type="number" step="0.01" value={adjustedAmount===null?"":adjustedAmount} onChange={function(e){setAdjustedAmount(e.target.value===""?null:parseFloat(e.target.value))}} style={{padding:"6px 10px",border:"1px solid #fde68a",borderRadius:6,fontSize:12,width:140,fontFamily:"monospace"}}/><button onClick={function(){if(adjustedAmount>0){setAmount(adjustedAmount);setBalanceVerified(true);setShowAmountAdjust(false);setStep(3)}}} style={Object.assign({},btn,{background:"#d97706"})}>Use this amount</button></div></div>:null}</div>:null}{balanceVerified?<div style={{marginTop:4,fontSize:12,color:"#16a34a"}}>✓ Balance verified</div>:null}</div>:null}
-    {step>=3&&isFraudPath?<div style={Object.assign({},sec,{borderColor:"#fecaca",background:"#fef2f2"})}><strong style={{fontSize:13,color:"#991b1b"}}>Step 4: Create FRAUD Ticket</strong><div style={{marginTop:4,fontSize:11,color:"#991b1b",fontWeight:600}}>Amount is over {fmtAmt(FRAUD_AMOUNT_THRESHOLD)} — routing to Fraud Operation instead of REIMB. No reimbursement, no admin debit.</div><div style={{marginTop:6,fontSize:12,background:"#fff",padding:10,borderRadius:6,border:"1px solid #e5e7eb"}}><div>Summary: <strong>{fraudSummary}</strong></div><div>Project: <strong>{FRAUD_PROJECT_KEY}</strong> · Issue type: <strong>Task</strong></div><div>Identity: <strong>{identityId||"—"}</strong> · Amount: <strong style={{color:"#dc2626"}}>{fmtAmt(amount)}</strong> · Tier: <strong>{userTier||"Premium"}</strong></div><div>Link: <strong>FRAUD {FRAUD_LINK_TYPE} {ticket.id}</strong></div><div style={{marginTop:6}}><label style={{fontSize:11,color:"#6b7280"}}>Fraud Detection Method * (customfield_10414 option label)</label><div style={{display:"flex",gap:6,alignItems:"center",marginTop:2}}><input type="text" value={detectionMethod} onChange={function(e){setDetectionMethod(e.target.value)}} placeholder="exact option label from Fraud Ops" style={{flex:1,padding:"6px 10px",border:"1px solid "+(detectionMethod.trim()?"#bbf7d0":"#fecaca"),borderRadius:6,fontSize:12,boxSizing:"border-box"}}/>{detectionMethod.trim()?<span style={{color:"#16a34a",fontSize:12,fontWeight:700}}>✓</span>:<span style={{color:"#dc2626",fontSize:10}}>Required</span>}</div>{!FRAUD_DETECTION_METHOD_LABEL?<div style={{marginTop:4,fontSize:10,color:"#92400e"}}>No default set — fill <code>FRAUD_DETECTION_METHOD_LABEL</code> in app-workflows.js to stop typing this each time.</div>:null}</div></div>{linkCheck==="checking"?<div style={{marginTop:6,fontSize:11,color:"#6b7280"}}>Checking {ticket.id} for an existing FRAUD link…</div>:null}{linkCheck==="failed"?<div style={{marginTop:6,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,fontSize:11,color:"#78350f"}}>⚠️ Couldn't check whether a FRAUD ticket already exists: {linkCheckError}. <button onClick={checkFraudLinks} style={{background:"none",border:"none",color:"#b45309",cursor:"pointer",fontSize:11,fontWeight:700,textDecoration:"underline",padding:0}}>Retry</button> · <button onClick={function(){setFraudBypass(true)}} style={{background:"none",border:"none",color:"#b45309",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline",padding:0}}>one already exists, go to REIMB</button></div>:null}{!fraudTicketId&&linkCheck!=="checking"?<button onClick={createFraudTicket} disabled={loading||!detectionMethod.trim()||!identityId} style={loading||!detectionMethod.trim()||!identityId?btnOff:Object.assign({},btn,{background:"#dc2626"})}>{loading?"Creating…":"✓ Create FRAUD Ticket"}</button>:null}{!fraudTicketId&&showManualFraudInput?<div style={{marginTop:8,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6}}><div style={{fontSize:11,fontWeight:600,color:"#78350f",marginBottom:6}}>Manual fallback: if the bridge new-tab succeeded, paste the FRAUD key here to continue.</div><div style={{display:"flex",gap:6}}><input value={manualFraudKey} onChange={function(e){setManualFraudKey(e.target.value.toUpperCase())}} placeholder="FRAUD-12345" style={{flex:1,padding:"6px 10px",border:"1px solid #fcd34d",borderRadius:6,fontSize:12,boxSizing:"border-box"}}/><button onClick={function(){var k=manualFraudKey.trim();if(!/^FRAUD-\d+$/i.test(k)){setError("Enter a valid FRAUD key like FRAUD-12345");return;}finishFraud(k.toUpperCase());}} style={{padding:"6px 12px",background:"#d97706",color:"#fff",border:"none",borderRadius:6,fontWeight:600,fontSize:12,cursor:"pointer"}}>Continue</button></div></div>:null}{fraudTicketId?<div style={{marginTop:6,fontSize:12}}>✓ Created <a href={"https://wealthsimple.atlassian.net/browse/"+fraudTicketId} target="_blank" rel="noreferrer" style={{color:"#dc2626",fontWeight:600}}>{fraudTicketId}</a> · linked {FRAUD_LINK_TYPE} {ticket.id}</div>:null}</div>:null}
-    {step>=3&&!isFraudPath?<div style={sec}><strong style={{fontSize:13}}>Step 4: Create REIMB Ticket</strong>{overFraudThreshold&&fraudAlreadyExists?<div style={{marginTop:6,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,fontSize:11,color:"#78350f",fontWeight:600}}>⚠️ {fmtAmt(amount)} is over {fmtAmt(FRAUD_AMOUNT_THRESHOLD)}, but {priorFraudKey?<a href={"https://wealthsimple.atlassian.net/browse/"+priorFraudKey} target="_blank" rel="noreferrer" style={{color:"#b45309",fontWeight:700}}>{priorFraudKey}</a>:"a FRAUD ticket"} was already raised{linkedFraudKeys.length?" and is linked to this ticket":" (link check failed — you confirmed it exists)"} — continuing on the normal reimbursement path.{fraudBypass?<button onClick={function(){setFraudBypass(false)}} style={{marginLeft:8,background:"none",border:"none",color:"#b45309",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline"}}>undo</button>:null}</div>:null}<div style={{marginTop:6,fontSize:12,background:"#fff",padding:10,borderRadius:6,border:"1px solid #e5e7eb"}}><div>Summary: <strong>Reimbursement for {ticket.id}</strong></div><div>Identity: <strong>{identityId}</strong> · Amount: <strong style={{color:"#dc2626"}}>{fmtAmt(amount)}</strong> · Approver: <strong>{approver.name}</strong> {!showApproverEdit?<button onClick={function(){setShowApproverEdit(true)}} style={{marginLeft:8,background:"none",border:"none",color:"#d97706",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline"}}>✏️ Override</button>:null}</div>{showApproverEdit?<div style={{marginTop:4,padding:8,background:"#fffbeb",borderRadius:6,border:"1px solid #fde68a"}}><div style={{display:"flex",gap:6}}>{[APPROVERS.luke,APPROVERS.amanda].map(function(a){return <button key={a.accountId} onClick={function(){setManualApprover(a);setShowApproverEdit(false)}} style={{padding:"4px 12px",borderRadius:6,fontSize:11,fontWeight:600,cursor:"pointer",background:approver.accountId===a.accountId?"#d97706":"#fff",color:approver.accountId===a.accountId?"#fff":"#d97706",border:"1px solid #fde68a"}}>{a.name}</button>})}</div></div>:null}<div>Tier: <strong>{userTier||"Premium"}</strong> {!showTierEdit?<button onClick={function(){setShowTierEdit(true)}} style={{background:"none",border:"none",color:"#4f46e5",cursor:"pointer",fontSize:11,textDecoration:"underline"}}>✏️</button>:null}</div>{showTierEdit?<div style={{marginTop:4,display:"flex",gap:6}}>{TIER_OPTIONS.map(function(tier){return <button key={tier.id} onClick={function(){setUserTier(tier.label);setUserTierId(tier.id);setShowTierEdit(false)}} style={{padding:"4px 12px",borderRadius:6,fontSize:11,fontWeight:600,cursor:"pointer",background:(userTierId||"13704")===tier.id?"#4f46e5":"#fff",color:(userTierId||"13704")===tier.id?"#fff":"#4f46e5",border:"1px solid #c7d2fe"}}>{tier.label}</button>})}</div>:null}<div style={{marginTop:6}}><label style={{fontSize:11,color:"#6b7280"}}>Cash Account ID *{isCCOvpType&&accountId?<span style={{color:"#4f46e5",marginLeft:4}}>(pre-filled — editable)</span>:null}</label><div style={{display:"flex",gap:6,alignItems:"center",marginTop:2}}><input type="text" value={accountId} onChange={function(e){setAccountId(e.target.value.toUpperCase())}} placeholder="e.g. WK292CZ38CAD" style={{flex:1,padding:"6px 10px",border:"1px solid "+(isCCOvpType&&accountId?"#c7d2fe":"#d1d5db"),borderRadius:6,fontSize:12,boxSizing:"border-box",fontFamily:"monospace",background:isCCOvpType&&accountId?"#eef2ff":"#fff"}}/>{accountIdValid?<span style={{color:"#16a34a",fontSize:12,fontWeight:700}}>✓</span>:null}{accountId&&!accountIdValid?<span style={{color:"#dc2626",fontSize:10}}>Invalid</span>:null}</div></div></div>{!reimTicketId?<button onClick={createReimTicket} disabled={loading||!accountIdValid} style={loading||!accountIdValid?btnOff:btnGo}>{loading?"Creating…":"✓ Create REIMB Ticket"}</button>:null}{!reimTicketId&&showManualReimbInput?<div style={{marginTop:8,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6}}><div style={{fontSize:11,fontWeight:600,color:"#78350f",marginBottom:6}}>Manual fallback: if the bridge new-tab succeeded, paste the REIMB key here to continue.</div><div style={{display:"flex",gap:6}}><input value={manualReimbKey} onChange={function(e){setManualReimbKey(e.target.value.toUpperCase())}} placeholder="REIMB-12345" style={{flex:1,padding:"6px 10px",border:"1px solid #fcd34d",borderRadius:6,fontSize:12,fontFamily:"monospace",boxSizing:"border-box"}}/><button onClick={function(){var k=manualReimbKey.trim();if(!/^REIMB-\d+$/i.test(k)){setError("Enter a valid REIMB key like REIMB-12345");return;}setReimTicketId(k);setCommentText("Hi {{REPORTER_MENTION}}, a reimbursement ticket has been created https://wealthsimple.atlassian.net/browse/"+k+"  You can mention to the client to expect to see the overpayment amount of "+fmtAmt(amount)+" back in their chequing account within the next 2-3 business days.");setStep(5);setShowManualReimbInput(false);setError(null);}} style={{padding:"6px 12px",background:"#d97706",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontSize:11,fontWeight:700}}>Use this key</button></div></div>:null}{reimTicketId?<div style={{marginTop:6,fontSize:12,color:"#16a34a"}}>✓ Created: <a href={"https://wealthsimple.atlassian.net/browse/"+reimTicketId} target="_blank" rel="noreferrer" style={{color:"#4f46e5",fontWeight:600}}>{reimTicketId}</a></div>:null}</div>:null}
+    {step>=3&&isFraudPath?<div style={Object.assign({},sec,{borderColor:"#fecaca",background:"#fef2f2"})}><strong style={{fontSize:13,color:"#991b1b"}}>Step 4: Create FRAUD Ticket</strong><div style={{marginTop:4,fontSize:11,color:"#991b1b",fontWeight:600}}>Amount is over {fmtAmt(FRAUD_AMOUNT_THRESHOLD)} — routing to Fraud Operation instead of REIMB. No reimbursement, no admin debit.</div><div style={{marginTop:6,fontSize:12,background:"#fff",padding:10,borderRadius:6,border:"1px solid #e5e7eb"}}><div>Summary: <strong>{fraudSummary}</strong></div><div>Project: <strong>{FRAUD_PROJECT_KEY}</strong> · Issue type: <strong>Task</strong></div><div>Identity: <strong>{identityId||"—"}</strong> · Amount: <strong style={{color:"#dc2626"}}>{fmtAmt(amount)}</strong> · Tier: <strong>{userTier||"Premium"}</strong></div><div>Link: <strong>FRAUD {FRAUD_LINK_TYPE} {ticket.id}</strong></div><div style={{marginTop:6}}><label style={{fontSize:11,color:"#6b7280"}}>Fraud Detection Method * (customfield_10414 option label)</label><div style={{display:"flex",gap:6,alignItems:"center",marginTop:2}}><input type="text" value={detectionMethod} onChange={function(e){setDetectionMethod(e.target.value)}} placeholder="exact option label from Fraud Ops" style={{flex:1,padding:"6px 10px",border:"1px solid "+(detectionMethod.trim()?"#bbf7d0":"#fecaca"),borderRadius:6,fontSize:12,boxSizing:"border-box"}}/>{detectionMethod.trim()?<span style={{color:"#16a34a",fontSize:12,fontWeight:700}}>✓</span>:<span style={{color:"#dc2626",fontSize:10}}>Required</span>}</div>{!FRAUD_DETECTION_METHOD_LABEL?<div style={{marginTop:4,fontSize:10,color:"#92400e"}}>No default set — fill <code>FRAUD_DETECTION_METHOD_LABEL</code> in app-workflows.js to stop typing this each time.</div>:null}</div></div>{linkCheck==="checking"?<div style={{marginTop:6,fontSize:11,color:"#6b7280"}}>Checking {ticket.id} for an existing FRAUD link…</div>:null}{linkCheck==="failed"?<div style={{marginTop:6,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,fontSize:11,color:"#78350f"}}>⚠️ Couldn't check whether a FRAUD ticket already exists: {linkCheckError}. <button onClick={checkFraudLinks} style={{background:"none",border:"none",color:"#b45309",cursor:"pointer",fontSize:11,fontWeight:700,textDecoration:"underline",padding:0}}>Retry</button> · <button onClick={function(){setFraudBypass("exists")}} style={{background:"none",border:"none",color:"#b45309",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline",padding:0}}>one already exists, go to REIMB</button></div>:null}{!fraudTicketId&&linkCheck!=="checking"?<div style={{marginTop:8,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}><button onClick={createFraudTicket} disabled={loading||!detectionMethod.trim()||!identityId} style={loading||!detectionMethod.trim()||!identityId?btnOff:Object.assign({},btn,{background:"#dc2626"})}>{loading?"Creating…":"✓ Create FRAUD Ticket"}</button>{!confirmBypass?<button onClick={function(){setConfirmBypass(true)}} disabled={loading} title="No fraud review needed — skip straight to the REIMB path" style={loading?btnOff:Object.assign({},btn,{background:"#fff",color:"#b45309",border:"1px solid #fcd34d"})}>⏭ Bypass Fraud</button>:null}</div>:null}{!fraudTicketId&&linkCheck!=="checking"&&confirmBypass?<div style={{marginTop:8,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6}}><div style={{fontSize:11,fontWeight:700,color:"#78350f",marginBottom:6}}>⚠️ Skip the fraud escalation for {fmtAmt(amount)}? No FRAUD ticket is raised — this continues on the normal reimbursement path.</div><div style={{display:"flex",gap:6}}><button onClick={function(){setConfirmBypass(false);setFraudBypass("skipped")}} style={{padding:"6px 12px",background:"#d97706",color:"#fff",border:"none",borderRadius:6,fontWeight:700,fontSize:12,cursor:"pointer"}}>Yes, skip fraud</button><button onClick={function(){setConfirmBypass(false)}} style={{padding:"6px 12px",background:"#fff",color:"#6b7280",border:"1px solid #d1d5db",borderRadius:6,fontWeight:600,fontSize:12,cursor:"pointer"}}>Cancel</button></div></div>:null}{!fraudTicketId&&showManualFraudInput?<div style={{marginTop:8,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6}}><div style={{fontSize:11,fontWeight:600,color:"#78350f",marginBottom:6}}>Manual fallback: if the bridge new-tab succeeded, paste the FRAUD key here to continue.</div><div style={{display:"flex",gap:6}}><input value={manualFraudKey} onChange={function(e){setManualFraudKey(e.target.value.toUpperCase())}} placeholder="FRAUD-12345" style={{flex:1,padding:"6px 10px",border:"1px solid #fcd34d",borderRadius:6,fontSize:12,boxSizing:"border-box"}}/><button onClick={function(){var k=manualFraudKey.trim();if(!/^FRAUD-\d+$/i.test(k)){setError("Enter a valid FRAUD key like FRAUD-12345");return;}finishFraud(k.toUpperCase());}} style={{padding:"6px 12px",background:"#d97706",color:"#fff",border:"none",borderRadius:6,fontWeight:600,fontSize:12,cursor:"pointer"}}>Continue</button></div></div>:null}{fraudTicketId?<div style={{marginTop:6,fontSize:12}}>✓ Created <a href={"https://wealthsimple.atlassian.net/browse/"+fraudTicketId} target="_blank" rel="noreferrer" style={{color:"#dc2626",fontWeight:600}}>{fraudTicketId}</a> · linked {FRAUD_LINK_TYPE} {ticket.id}</div>:null}</div>:null}
+    {step>=3&&!isFraudPath?<div style={sec}><strong style={{fontSize:13}}>Step 4: Create REIMB Ticket</strong>{overFraudThreshold&&fraudAlreadyExists?<div style={{marginTop:6,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6,fontSize:11,color:"#78350f",fontWeight:600}}>{fraudBypass==="skipped"&&!linkedFraudKeys.length?<span>⚠️ {fmtAmt(amount)} is over {fmtAmt(FRAUD_AMOUNT_THRESHOLD)}, but the fraud escalation was skipped by the operator — no FRAUD ticket was raised, continuing on the normal reimbursement path.</span>:<span>⚠️ {fmtAmt(amount)} is over {fmtAmt(FRAUD_AMOUNT_THRESHOLD)}, but {priorFraudKey?<a href={"https://wealthsimple.atlassian.net/browse/"+priorFraudKey} target="_blank" rel="noreferrer" style={{color:"#b45309",fontWeight:700}}>{priorFraudKey}</a>:"a FRAUD ticket"} was already raised{linkedFraudKeys.length?" and is linked to this ticket":" (link check failed — you confirmed it exists)"} — continuing on the normal reimbursement path.</span>}{fraudBypass?<button onClick={function(){setFraudBypass(null);setConfirmBypass(false)}} style={{marginLeft:8,background:"none",border:"none",color:"#b45309",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline"}}>undo</button>:null}</div>:null}<div style={{marginTop:6,fontSize:12,background:"#fff",padding:10,borderRadius:6,border:"1px solid #e5e7eb"}}><div>Summary: <strong>Reimbursement for {ticket.id}</strong></div><div>Identity: <strong>{identityId}</strong> · Amount: <strong style={{color:"#dc2626"}}>{fmtAmt(amount)}</strong> · Approver: <strong>{approver.name}</strong> {!showApproverEdit?<button onClick={function(){setShowApproverEdit(true)}} style={{marginLeft:8,background:"none",border:"none",color:"#d97706",cursor:"pointer",fontSize:11,fontWeight:600,textDecoration:"underline"}}>✏️ Override</button>:null}</div>{showApproverEdit?<div style={{marginTop:4,padding:8,background:"#fffbeb",borderRadius:6,border:"1px solid #fde68a"}}><div style={{display:"flex",gap:6}}>{[APPROVERS.luke,APPROVERS.amanda].map(function(a){return <button key={a.accountId} onClick={function(){setManualApprover(a);setShowApproverEdit(false)}} style={{padding:"4px 12px",borderRadius:6,fontSize:11,fontWeight:600,cursor:"pointer",background:approver.accountId===a.accountId?"#d97706":"#fff",color:approver.accountId===a.accountId?"#fff":"#d97706",border:"1px solid #fde68a"}}>{a.name}</button>})}</div></div>:null}<div>Tier: <strong>{userTier||"Premium"}</strong> {!showTierEdit?<button onClick={function(){setShowTierEdit(true)}} style={{background:"none",border:"none",color:"#4f46e5",cursor:"pointer",fontSize:11,textDecoration:"underline"}}>✏️</button>:null}</div>{showTierEdit?<div style={{marginTop:4,display:"flex",gap:6}}>{TIER_OPTIONS.map(function(tier){return <button key={tier.id} onClick={function(){setUserTier(tier.label);setUserTierId(tier.id);setShowTierEdit(false)}} style={{padding:"4px 12px",borderRadius:6,fontSize:11,fontWeight:600,cursor:"pointer",background:(userTierId||"13704")===tier.id?"#4f46e5":"#fff",color:(userTierId||"13704")===tier.id?"#fff":"#4f46e5",border:"1px solid #c7d2fe"}}>{tier.label}</button>})}</div>:null}<div style={{marginTop:6}}><label style={{fontSize:11,color:"#6b7280"}}>Cash Account ID *{isCCOvpType&&accountId?<span style={{color:"#4f46e5",marginLeft:4}}>(pre-filled — editable)</span>:null}</label><div style={{display:"flex",gap:6,alignItems:"center",marginTop:2}}><input type="text" value={accountId} onChange={function(e){setAccountId(e.target.value.toUpperCase())}} placeholder="e.g. WK292CZ38CAD" style={{flex:1,padding:"6px 10px",border:"1px solid "+(isCCOvpType&&accountId?"#c7d2fe":"#d1d5db"),borderRadius:6,fontSize:12,boxSizing:"border-box",fontFamily:"monospace",background:isCCOvpType&&accountId?"#eef2ff":"#fff"}}/>{accountIdValid?<span style={{color:"#16a34a",fontSize:12,fontWeight:700}}>✓</span>:null}{accountId&&!accountIdValid?<span style={{color:"#dc2626",fontSize:10}}>Invalid</span>:null}</div></div></div>{!reimTicketId?<button onClick={createReimTicket} disabled={loading||!accountIdValid} style={loading||!accountIdValid?btnOff:btnGo}>{loading?"Creating…":"✓ Create REIMB Ticket"}</button>:null}{!reimTicketId&&showManualReimbInput?<div style={{marginTop:8,padding:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:6}}><div style={{fontSize:11,fontWeight:600,color:"#78350f",marginBottom:6}}>Manual fallback: if the bridge new-tab succeeded, paste the REIMB key here to continue.</div><div style={{display:"flex",gap:6}}><input value={manualReimbKey} onChange={function(e){setManualReimbKey(e.target.value.toUpperCase())}} placeholder="REIMB-12345" style={{flex:1,padding:"6px 10px",border:"1px solid #fcd34d",borderRadius:6,fontSize:12,fontFamily:"monospace",boxSizing:"border-box"}}/><button onClick={function(){var k=manualReimbKey.trim();if(!/^REIMB-\d+$/i.test(k)){setError("Enter a valid REIMB key like REIMB-12345");return;}setReimTicketId(k);setCommentText("Hi {{REPORTER_MENTION}}, a reimbursement ticket has been created https://wealthsimple.atlassian.net/browse/"+k+"  You can mention to the client to expect to see the overpayment amount of "+fmtAmt(amount)+" back in their chequing account within the next 2-3 business days.");setStep(5);setShowManualReimbInput(false);setError(null);}} style={{padding:"6px 12px",background:"#d97706",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontSize:11,fontWeight:700}}>Use this key</button></div></div>:null}{reimTicketId?<div style={{marginTop:6,fontSize:12,color:"#16a34a"}}>✓ Created: <a href={"https://wealthsimple.atlassian.net/browse/"+reimTicketId} target="_blank" rel="noreferrer" style={{color:"#4f46e5",fontWeight:600}}>{reimTicketId}</a></div>:null}</div>:null}
     {step>=5&&!isFraudPath?<div style={sec}><strong style={{fontSize:13}}>Step 5: Admin Debit in i2c</strong>{!adminDebitDone?<div style={{marginTop:8}}><div style={{background:"#fff",borderRadius:6,padding:10,border:"1px solid #e5e7eb",fontSize:11,lineHeight:1.7}}><div>1. Open i2c: <a href="https://wealthsimplecs.mycardplace.com/customerservice/wealthsimplelogin.jsp" target="_blank" rel="noreferrer" style={{color:"#4f46e5"}}>🔗 Open i2c</a></div><div>2. Administrative Services tab</div><div>3. Admin Debit — <strong style={{color:"#dc2626"}}>{fmtAmt(amount)}</strong></div></div><button onClick={function(){setAdminDebitDone(true);setStep(6)}} style={Object.assign({},btnGo,{marginTop:8})}>✓ Admin Debit Applied</button></div>:null}{adminDebitDone?<div style={{marginTop:4,fontSize:12,color:"#16a34a"}}>✓ Admin Debit of {fmtAmt(amount)} applied</div>:null}</div>:null}
     {step>=6?<div style={sec}><strong style={{fontSize:13}}>Step 6: Post Comment on {ticket.id}</strong>{!commentPosted?<div style={{marginTop:6}}>{!editingComment?<div style={{fontSize:12,background:"#fff",padding:10,borderRadius:6,border:"1px solid #e5e7eb",whiteSpace:"pre-wrap",lineHeight:1.6}}>{commentText}</div>:null}{editingComment?<textarea value={commentText} onChange={function(e){setCommentText(e.target.value)}} rows={6} style={{width:"100%",boxSizing:"border-box",padding:10,border:"1px solid #c7d2fe",borderRadius:6,fontSize:12,lineHeight:1.6,resize:"vertical"}}/>:null}<div style={{display:"flex",gap:8,marginTop:8}}>{!editingComment?<button onClick={function(){setEditingComment(true)}} style={Object.assign({},btn,{background:"#d97706"})}>✏️ Edit</button>:null}{editingComment?<button onClick={function(){setEditingComment(false)}} style={btn}>✓ Done</button>:null}{!editingComment&&step===6?<button onClick={function(){setStep(7)}} style={btn}>Review → Approve</button>:null}</div></div>:null}{commentPosted?<div style={{marginTop:4,fontSize:12,color:"#16a34a"}}>✓ Comment posted</div>:null}</div>:null}
     {step===7&&!commentPosted?<div style={Object.assign({},sec,{borderColor:"#fde68a",background:"#fffbeb"})}><strong style={{fontSize:13,color:"#92400e"}}>⚠️ Post this comment?</strong><div style={{marginTop:8,display:"flex",gap:8}}><button onClick={postComment} disabled={loading} style={loading?btnOff:btnGo}>{loading?"Posting…":"✓ Post"}</button><button onClick={function(){setStep(6)}} style={Object.assign({},btn,{background:"#fff",color:"#6b7280",border:"1px solid #d1d5db"})}>← Back</button></div></div>:null}

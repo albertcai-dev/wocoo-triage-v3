@@ -8,6 +8,7 @@ function Dashboard(){
   var _tt=useState(null),triageTarget=_tt[0],setTriageTarget=_tt[1];
   var _iq=useState(null),inquiryTarget=_iq[0],setInquiryTarget=_iq[1];
   var _tr=useState(null),transcriptTarget=_tr[0],setTranscriptTarget=_tr[1];
+  var _cc=useState(null),ccStatementTarget=_cc[0],setCcStatementTarget=_cc[1];
   var _mt=useState(null),moveTarget=_mt[0],setMoveTarget=_mt[1];
   var _lr=useState(new Date().toLocaleTimeString()),lastReload=_lr[0],setLastReload=_lr[1];
   var _ts=useState([]),toasts=_ts[0],setToasts=_ts[1];
@@ -306,6 +307,7 @@ function Dashboard(){
       <button style={tabStyle("overview")} onClick={function(){setTab("overview")}}>Overview</button>
       <button style={tabStyle("tickets")} onClick={function(){setTab("tickets")}}>All Tickets ({liveTickets.length})</button>
       <button style={tabStyle("resolution")} onClick={function(){setTab("resolution")}}>Resolution Steps</button>
+      <button style={tabStyle("cheques")} onClick={function(){setTab("cheques")}}>Cheque Validation</button>
       <button style={tabStyle("settings")} onClick={function(){setTab("settings")}}>Settings</button>
     </div>
 
@@ -324,6 +326,7 @@ function Dashboard(){
       {moveTarget?<MoveModal ticket={moveTarget} assigneeName={(ASSIGNEES.find(function(a){return a.value===selectedAssignee})||{}).name||""} onClose={function(){setMoveTarget(null)}}/>:null}
       {inquiryTarget?<InquiryRemovalModal associate={(ASSIGNEES.find(function(a){return a.value===selectedAssignee})||{}).name||""} onClose={function(){setInquiryTarget(null)}}/>:null}
       {transcriptTarget?<TranscriptParserModal ticket={transcriptTarget} onClose={function(){setTranscriptTarget(null)}}/>:null}
+      {ccStatementTarget?<CustomCcStatementModal ticket={ccStatementTarget} onClose={function(){setCcStatementTarget(null)}}/>:null}
       <div style={{maxHeight:"calc(100vh - 240px)",overflowY:"auto"}}><table style={{width:"100%",borderCollapse:"separate",borderSpacing:0,fontSize:12}}><thead><tr>{[["id","Ticket"],["type","Type"],["category","Category"],["statusGroup","Status"],["priority","Priority"],["triageMethod","Triage"],["created","Created"]].map(function(h){return <th key={h[0]} onClick={function(){handleSort(h[0])}} style={{position:"sticky",top:0,zIndex:2,background:darkMode?"#1e293b":"#fafafa",borderBottom:"2px solid "+(darkMode?"#334155":"#e5e7eb"),textAlign:"left",padding:"8px",color:darkMode?"#94a3b8":"#6b7280",cursor:"pointer",userSelect:"none",fontSize:11,fontWeight:600,boxShadow:"0 1px 0 "+(darkMode?"#334155":"#e5e7eb")}}>{h[1]} {sortCol===h[0]?(sortDir===1?"↑":"↓"):""}</th>})}<th style={{position:"sticky",top:0,zIndex:2,background:darkMode?"#1e293b":"#fafafa",borderBottom:"2px solid "+(darkMode?"#334155":"#e5e7eb"),textAlign:"center",padding:"8px",color:darkMode?"#94a3b8":"#6b7280",fontSize:11,fontWeight:600,boxShadow:"0 1px 0 "+(darkMode?"#334155":"#e5e7eb")}}>Action</th></tr></thead>
       <tbody>{reloading?Array.from({length:8}).map(function(_unused,i){return <tr key={"skel"+i} style={{borderBottom:"1px solid "+(darkMode?"#334155":"#e5e7eb")}}><td style={{padding:"8px"}}><span className="wocoo-skel" style={{width:90,height:14}}/></td><td style={{padding:"8px"}}><span className="wocoo-skel" style={{width:130,height:12}}/></td><td style={{padding:"8px"}}><span className="wocoo-skel" style={{width:160,height:12}}/></td><td style={{padding:"8px"}}><span className="wocoo-skel" style={{width:60,height:18,borderRadius:9999}}/></td><td style={{padding:"8px"}}><span className="wocoo-skel" style={{width:50,height:12}}/></td><td style={{padding:"8px"}}><span className="wocoo-skel" style={{width:60,height:16,borderRadius:4}}/></td><td style={{padding:"8px"}}><span className="wocoo-skel" style={{width:70,height:12}}/></td><td style={{padding:"6px 4px",textAlign:"center"}}><span className="wocoo-skel" style={{width:140,height:22,borderRadius:6}}/></td></tr>}):sorted.length===0?[<tr key="empty"><td colSpan={8} style={{padding:"48px 16px",textAlign:"center",color:darkMode?"#64748b":"#9ca3af"}}><div style={{fontSize:36,marginBottom:8}}>{searchText?"🔍":"🎉"}</div><div style={{fontSize:14,fontWeight:600,marginBottom:4,color:darkMode?"#cbd5e1":"#374151"}}>{searchText?"No tickets match":(filterStatus==="all"?"No tickets":"All clear!")}</div><div style={{fontSize:12}}>{searchText?"Try a different search term or clear the search.":(filterStatus==="all"?"":"No "+filterStatus+" tickets right now.")}</div></td></tr>]:sorted.map(function(t){
         var slaCls="",slaTitle="";
@@ -355,7 +358,7 @@ function Dashboard(){
                 <button onClick={function(e){e.stopPropagation();setOpenToolsId(openToolsId===t.id?null:t.id)}} title="More actions" style={{padding:"4px 8px",background:openToolsId===t.id?"#6d28d9":"#7c3aed",color:"#fff",border:"none",borderRadius:6,cursor:"pointer",fontSize:10,fontWeight:700}}>Tools ▾</button>
                 {openToolsId===t.id?<div style={{position:"absolute",right:0,top:"calc(100% + 4px)",background:"#fff",border:"1px solid #e5e7eb",borderRadius:8,boxShadow:"0 4px 16px rgba(0,0,0,0.18)",padding:4,minWidth:200,zIndex:1500,textAlign:"left"}}>
                   <button onClick={function(){setOpenToolsId(null);setTriageTarget(t)}} style={{display:"block",width:"100%",textAlign:"left",padding:"8px 12px",background:"none",border:"none",borderRadius:4,cursor:"pointer",fontSize:12,fontWeight:600,color:"#111827"}}>⚡ Overpayment Triage</button>
-                  <a href="https://www.visa.ca/en_CA/support/consumer/travel-support/exchange-rate-calculator.html" target="_blank" rel="noreferrer" onClick={function(){setOpenToolsId(null)}} style={{display:"block",width:"100%",padding:"8px 12px",borderRadius:4,fontSize:12,fontWeight:600,color:"#111827",textDecoration:"none"}}>💱 Check FX (Visa)</a>
+                  <button onClick={function(){setOpenToolsId(null);setCcStatementTarget(t)}} style={{display:"block",width:"100%",textAlign:"left",padding:"8px 12px",background:"none",border:"none",borderRadius:4,cursor:"pointer",fontSize:12,fontWeight:600,color:"#111827"}}>🧾 Custom CC Statement</button>
                   <button onClick={function(){setOpenToolsId(null);setInquiryTarget(t)}} style={{display:"block",width:"100%",textAlign:"left",padding:"8px 12px",background:"none",border:"none",borderRadius:4,cursor:"pointer",fontSize:12,fontWeight:600,color:"#111827"}}>🧾 Inquiry Removal</button>
                   <button onClick={function(){setOpenToolsId(null);setTranscriptTarget(t)}} style={{display:"block",width:"100%",textAlign:"left",padding:"8px 12px",background:"none",border:"none",borderRadius:4,cursor:"pointer",fontSize:12,fontWeight:600,color:"#111827"}}>🎙 Parse Transcript</button>
                 </div>:null}
@@ -382,6 +385,8 @@ function Dashboard(){
     </div>:null}
 
     {tab==="resolution"?<div style={{display:"flex",flexDirection:"column",gap:12}}>{Object.keys(RESOLUTION_STEPS).sort().map(function(cat){var r=RESOLUTION_STEPS[cat];var n=liveTickets.filter(function(t){return t.category===cat}).length;return <div key={cat} style={{background:"#fff",borderRadius:12,padding:16,border:"1px solid #e5e7eb"}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}><div><h3 style={{margin:0,fontSize:15}}>{cat}</h3><div style={{fontSize:11,color:"#9ca3af",marginTop:2}}>{r.source} · {r.sla}</div></div><span style={{background:"#eef2ff",color:"#4f46e5",padding:"3px 10px",borderRadius:9999,fontSize:11,fontWeight:600}}>{n}</span></div><div style={{borderTop:"1px solid #f3f4f6",paddingTop:10}}>{r.steps.map(function(s,i){return <div key={i} style={{fontSize:12,color:"#374151",marginBottom:5,lineHeight:1.6}}>{s}</div>})}<GuruLookup category={cat} summary="" description="" ticketId=""/></div></div>})}</div>:null}
+
+    {tab==="cheques"?<MobileChequeValidationTab/>:null}
 
     {tab==="settings"?<div style={{display:"flex",flexDirection:"column",gap:12,maxWidth:720}}>
       <div style={{background:"#fff",borderRadius:12,padding:16,border:"1px solid #e5e7eb"}}>
