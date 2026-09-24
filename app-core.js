@@ -821,22 +821,21 @@ function ccStripRowDelimiters(value) {
 }
 
 // ============ INQUIRY REMOVAL (TransUnion) — doc create + PDF email via bridge ============
-var INQUIRY_REMOVAL_TEMPLATE_ID = "1wdfRDkRshpBTrGhrPX3-zrKlDVpmp4NXkumsFKvJkxQ";
+// Template: "TU Removal Letterhead". The bridge (InquiryRemoval.gs) owns the copy + fill.
+var INQUIRY_REMOVAL_TEMPLATE_ID = "1Rm4IrpFn1bdm7USiJWq_B1j_8RR2HSrjq4R-Swi9KLM";
 var TRANSUNION_EMAIL = "TUCCustServ@transunion.com";
+var INQUIRY_DEFAULT_ROLE = "Associate, Cash & Cards Operations";
 
 // Bridge action createInquiryDoc: copies the template into the associate's My Drive,
-// prefills the letter fields, returns { docId, docUrl }.
+// fills [Customer Full Name] [Address] [Date of inquiry] [Name] [Role] ([Date] = today),
+// returns { docId, docUrl }.
 function createInquiryDocViaBridge(f) {
   return callBridgeViaIframe("createInquiryDoc", {
-    firstName: f.firstName || "",
-    lastName: f.lastName || "",
+    fullName: f.fullName || "",
     address: f.address || "",
-    city: f.city || "",
-    postalCode: f.postalCode || "",
-    dob: f.dob || "",
-    phone: f.phone || "",
     dateOfInquiry: f.dateOfInquiry || "",
-    associate: f.associate || ""
+    associate: f.associate || "",
+    role: f.role || ""
   }, "inquiryDocCreated");
 }
 
@@ -1313,6 +1312,6 @@ var RESOLUTION_STEPS={
   "Other / Eligibility Confirmation":{source:"WOCOO Wiki",sla:"First touch <1 day",steps:["1. Confirm in Atlas.","2. Done if confirmed.","3. Overflow: WORS/BOTI."]},
   "Cash: Cheques":{source:"WOCOO Wiki",sla:"First touch <1 day · Ops SLA 5 days",steps:["1. Unrecognized: cheque images.","2. Rejected: check reason.","3. Bounced: WORS."]},
   "Visa Airport Companion":{source:"WOCOO Wiki",sla:"First touch <1 day",steps:["1. Check known platform issues.","2. If known: comment + Done.","3. If not: verify card type (VIP) and >30 days."]},
-  "Inquiry Removal":{source:"WOCOO Wiki",sla:"First touch <1 day",steps:["1. Confirm the reason: client applied for a WS Credit Card and is displeased with the credit limit offered (courtesy removal request).","2. Gather client info: name, address, city, postal code, DOB, phone, and date of inquiry (card application/open date).","3. Tools ▾ → 🧾 Inquiry Removal → fill the fields → Generate Document.","4. Review the generated letter in Google Docs; edit if anything needs adjusting.","5. Email to TransUnion → Confirm Send (PDF auto-attached, sent to TUCCustServ@transunion.com).","6. Comment on the ticket and move to Done."]},
+  "Inquiry Removal":{source:"WOCOO Wiki — TU Inquiry Removal",sla:"First touch <1 day",steps:["1. Confirm the client wants the TransUnion hard credit inquiry removed (e.g. a WS system error caused an unintended check, or they did not want a credit check during the application).","2. In Atlas, get the client's full name, full address, and the date of inquiry.","3. Tools ▾ → 🧾 Inquiry Removal → fill every field → Generate Document.","4. Review the letter in Google Docs: no [brackets] left, name/address match Atlas, and the reason paragraph fits the client's situation.","5. Email to TransUnion → Confirm Send (PDF auto-attached, sent to TUCCustServ@transunion.com). If TransUnion replies with a corrected inquiry date, fix the letter and reply on the same thread.","6. Comment on the ticket with the date sent, let the client know TransUnion makes the final decision, and move to Done."]},
 };
 

@@ -835,14 +835,15 @@ function ccSplitCityProvince(line){
 
 function InquiryRemovalModal(props){
   var onClose=props.onClose;
-  var _f=useState({firstName:"",lastName:"",address:"",city:"",postalCode:"",dob:"",phone:"",dateOfInquiry:"",associate:props.associate||""}),f=_f[0],setF=_f[1];
+  var _f=useState({fullName:"",address:"",dateOfInquiry:"",associate:props.associate||"",role:INQUIRY_DEFAULT_ROLE}),f=_f[0],setF=_f[1];
   var _st=useState("form"),st=_st[0],setSt=_st[1]; // form|generating|generated|confirming|sending|sent|error
   var _doc=useState(null),doc=_doc[0],setDoc=_doc[1];
   var _res=useState(null),res=_res[0],setRes=_res[1];
   var _err=useState(null),err=_err[0],setErr=_err[1];
   var set=function(k,v){setF(function(p){var n=Object.assign({},p);n[k]=v;return n})};
-  var clientName=((f.firstName||"")+" "+(f.lastName||"")).trim();
-  var canGenerate=f.firstName.trim()&&f.lastName.trim()&&f.associate.trim();
+  var clientName=(f.fullName||"").trim();
+  // Every placeholder must be filled, or the PDF goes to TransUnion with [brackets] in it.
+  var canGenerate=["fullName","address","dateOfInquiry","associate","role"].every(function(k){return (f[k]||"").trim()});
   var generate=function(){
     setSt("generating");setErr(null);
     createInquiryDocViaBridge(f).then(function(d){
@@ -861,7 +862,7 @@ function InquiryRemovalModal(props){
   var sec={padding:"14px 20px",borderBottom:"1px solid #f3f4f6"};
   var lblText={display:"block",fontSize:11,color:"#6b7280",fontWeight:600,marginBottom:3};
   var inp={width:"100%",boxSizing:"border-box",padding:"6px 10px",border:"1px solid #d1d5db",borderRadius:6,fontSize:12};
-  var fieldsDef=[["firstName","First Name"],["lastName","Last Name"],["address","Address"],["city","City"],["postalCode","Postal Code"],["dob","Date of Birth"],["phone","Phone Number"],["dateOfInquiry","Date of Inquiry"],["associate","Associate"]];
+  var fieldsDef=[["fullName","Client Full Name","As shown in Atlas"],["address","Address","Street, City, Province Postal Code"],["dateOfInquiry","Date of Inquiry","e.g. May 27, 2026"],["associate","Your Name","Your full name"],["role","Your Role","e.g. "+INQUIRY_DEFAULT_ROLE]];
   var locked=st==="generating"||st==="sending"||st==="confirming";
   return <div style={overlay} onClick={function(e){if(e.target===e.currentTarget)onClose()}}>
     <div style={card} onClick={function(e){e.stopPropagation()}}>
@@ -874,9 +875,9 @@ function InquiryRemovalModal(props){
       <div style={sec}>
         <strong style={{display:"block",marginBottom:8,fontSize:13}}>Letter Fields</strong>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-          {fieldsDef.map(function(fd){var k=fd[0],label=fd[1];var full=(k==="address");return <div key={k} style={full?{gridColumn:"1 / -1"}:null}>
+          {fieldsDef.map(function(fd){var k=fd[0],label=fd[1],hint=fd[2];var full=(k==="fullName"||k==="address");return <div key={k} style={full?{gridColumn:"1 / -1"}:null}>
             <label style={lblText}>{label}</label>
-            <input type="text" value={f[k]} disabled={locked||st==="sent"} onChange={function(e){set(k,e.target.value)}} placeholder={label} style={inp}/>
+            <input type="text" value={f[k]} disabled={locked||st==="sent"} onChange={function(e){set(k,e.target.value)}} placeholder={hint} style={inp}/>
           </div>})}
         </div>
       </div>
@@ -887,7 +888,7 @@ function InquiryRemovalModal(props){
         :
           <div style={{fontSize:12,color:"#166534"}}>✓ Document created — <a href={doc.docUrl} target="_blank" rel="noreferrer" style={{color:"#4f46e5",fontWeight:600}}>open the doc</a> to review/edit before emailing.</div>
         }
-        {!canGenerate&&!doc?<div style={{fontSize:11,color:"#9ca3af",marginTop:6}}>First name, last name, and associate are required.</div>:null}
+        {!canGenerate&&!doc?<div style={{fontSize:11,color:"#9ca3af",marginTop:6}}>All fields are required. Get the client's name, address, and date of inquiry from Atlas.</div>:null}
       </div>:null}
 
       {doc&&st!=="sent"?<div style={sec}>
