@@ -178,6 +178,8 @@ var statusColors={Triage:"#dc2626","Back Office":"#d97706",Pending:"#2563eb",Don
 var priorityColors={Highest:"#dc2626",High:"#ea580c",Medium:"#ca8a04",Low:"#16a34a",Lowest:"#6b7280"};
 var ACCOUNT_ID_RE=/^[CHWN][0-9A-Z]{7,}$/i;
 var APPROVERS={luke:{name:"Luke Gazmin",accountId:"712020:9afdb43a-362c-4a1e-a2bd-99df2619b105"},amanda:{name:"Amanda Burke",accountId:"62006b10ed02400069a11d5a"}};
+// Luke OOO: Amanda covers <$5K approvals through Fri 2026-10-02; reverts automatically at local midnight.
+var LUKE_OOO_UNTIL=new Date(2026,9,3);
 var ASSIGNEES=[{name:"Albert Cai",value:"albert"},{name:"Luke Gazmin",value:"luke"},{name:"Esther Liao",value:"esther"},{name:"Ishan Jain",value:"ishan"}];
 var EOC_CLIENT_STATUS=[{label:"Core",id:"17688"},{label:"Premium",id:"17689"},{label:"Generation",id:"17690"}];
 
